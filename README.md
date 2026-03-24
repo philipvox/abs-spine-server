@@ -2,6 +2,17 @@
 
 A lightweight image server that serves custom book spine images for [AudiobookShelf](https://www.audiobookshelf.org/) mobile apps. Drop in spine images, run the server, and your books get custom spines on the shelf view.
 
+**Name your files however you want.** The server auto-matches them to your books:
+
+```
+spines/
+├── Dune.png                          ← matched by title
+├── Frank Herbert - Dune.png          ← matched by author + title
+├── The_Hobbit.png                    ← underscores work too
+├── 1984.jpg                          ← numbers, symbols, all fine
+└── li_8f7bd2c8-0146-41be-8207.png    ← or use the book ID directly
+```
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                                                             │
@@ -9,14 +20,14 @@ A lightweight image server that serves custom book spine images for [AudiobookSh
 │                                                             │
 │   ┌───────────┐      ┌───────────────┐     ┌───────────┐   │
 │   │           │      │               │     │           │   │
-│   │  "Do you  │─────>│  manifest.json│     │           │   │
-│   │  have any │      │  (book ID     │     │           │   │
-│   │  spines?" │      │   list)       │     │           │   │
-│   │           │      │               │     │           │   │
-│   │  "Give me │─────>│  spines/      │     │  Audio,   │   │
-│   │  spine for│      │  li_abc.png   │     │  covers,  │   │
-│   │  book X"  │      │  li_def.png   │     │  metadata │   │
-│   │           │      │  li_ghi.jpg   │     │           │   │
+│   │  "Do you  │─────>│  On startup:  │     │           │   │
+│   │  have any │      │  1. Asks ABS  │────>│  Book     │   │
+│   │  spines?" │      │     for books │     │  list     │   │
+│   │           │      │  2. Matches   │     │           │   │
+│   │  "Give me │─────>│     filenames │     │           │   │
+│   │  spine for│      │     to books  │     │  Audio,   │   │
+│   │  book X"  │      │  3. Serves    │     │  covers,  │   │
+│   │           │      │     images    │     │  metadata │   │
 │   └───────────┘      └───────────────┘     └───────────┘   │
 │                        port 8786            port 13378      │
 │                                                             │
@@ -33,10 +44,10 @@ A lightweight image server that serves custom book spine images for [AudiobookSh
 - [Quick Start (No Docker)](#quick-start-no-docker)
 - [Step-by-Step Guide](#step-by-step-guide)
   - [Step 1: Get Your ABS API Key](#step-1-get-your-abs-api-key)
-  - [Step 2: Find Your Book IDs](#step-2-find-your-book-ids)
-  - [Step 3: Add Spine Images](#step-3-add-spine-images)
-  - [Step 4: Start the Server](#step-4-start-the-server)
-  - [Step 5: Connect the App](#step-5-connect-the-app)
+  - [Step 2: Add Spine Images](#step-2-add-spine-images)
+  - [Step 3: Start the Server](#step-3-start-the-server)
+  - [Step 4: Connect the App](#step-4-connect-the-app)
+- [File Naming Guide](#file-naming-guide)
 - [Creating Spine Images](#creating-spine-images)
 - [Configuration Reference](#configuration-reference)
 - [Docker Compose Examples](#docker-compose-examples)
@@ -50,11 +61,11 @@ A lightweight image server that serves custom book spine images for [AudiobookSh
 
 AudiobookShelf doesn't have a built-in "book spine" feature. This server fills that gap by serving spine images to the mobile app over HTTP.
 
-**The server does exactly two things:**
+**The server does three things:**
 
-1. **Serves a manifest** — a JSON list of which books have spine images available. The app checks this once at startup so it knows which books to ask for.
-
-2. **Serves spine images** — when the app wants to display a spine, it requests the image from this server by book ID.
+1. **Connects to ABS on startup** to learn your book titles, authors, and IDs
+2. **Auto-matches your image filenames** to the right books (by title, author, or ID)
+3. **Serves spine images** to the app when requested
 
 **What it does NOT do:**
 - It does not modify your ABS server or library
@@ -76,19 +87,15 @@ AudiobookShelf doesn't have a built-in "book spine" feature. This server fills t
 
 ```bash
 # Clone
-git clone https://github.com/YOUR_USERNAME/abs-spine-server.git
+git clone https://github.com/philipvox/abs-spine-server.git
 cd abs-spine-server
 
 # Create a folder for your spine images
 mkdir spines
 
-# Set your API key
-export ABS_API_KEY="your-key-here"
+# Put spine images in spines/ — name them by title, e.g. "Dune.png"
 
-# See your books and their IDs
-docker compose run --rm spine-server --list-books
-
-# Put spine images in spines/ named by book ID (e.g. spines/li_abc123.png)
+# Edit docker-compose.yml → set your ABS_API_KEY
 
 # Start the server
 docker compose up -d
@@ -101,13 +108,10 @@ curl http://localhost:8786/health
 
 ```bash
 # Clone
-git clone https://github.com/YOUR_USERNAME/abs-spine-server.git
+git clone https://github.com/philipvox/abs-spine-server.git
 cd abs-spine-server
 
-# See your books and their IDs
-ABS_URL=http://your-abs-server:13378 ABS_API_KEY=your-key python3 spine_server.py --list-books
-
-# Put spine images in spines/ named by book ID (e.g. spines/li_abc123.png)
+# Put spine images in spines/ — name them by title, e.g. "Dune.png"
 
 # Start the server
 ABS_URL=http://your-abs-server:13378 ABS_API_KEY=your-key python3 spine_server.py
@@ -132,53 +136,41 @@ The spine server needs to talk to your ABS server to learn about your books. It 
 
 > **What is an API key?** It's like a password that lets programs talk to your ABS server. The spine server uses it to get your book list. It only reads data — it never changes anything.
 
-### Step 2: Find Your Book IDs
+### Step 2: Add Spine Images
 
-Every book in ABS has a unique ID (like `li_8f7bd2c8-0146-41be-8207-3a11456bd4b3`). You need these IDs to name your spine image files.
-
-**With Docker:**
-```bash
-# First, edit docker-compose.yml and set your ABS_API_KEY
-# Then:
-docker compose run --rm spine-server --list-books
-```
-
-**Without Docker:**
-```bash
-ABS_URL=http://your-abs-server:13378 \
-ABS_API_KEY=your-key \
-python3 spine_server.py --list-books
-```
-
-You'll see output like this:
-```
-Found 247 books:
-
-BOOK ID                        TITLE                                              AUTHOR
---------------------------------------------------------------------------------------------------------------
-li_8f7bd2c8-0146-41be-8207     1984                                               George Orwell
-li_a2c3d4e5-f6g7-h8i9-j0k1     Dune                                               Frank Herbert
-li_b3c4d5e6-g7h8-i9j0-k1l2     The Hobbit                                         J.R.R. Tolkien
-...
-
---- How to use these IDs ---
-Name your spine image files using the BOOK ID above.
-Put them in: ./spines/
-Example: ./spines/li_8f7bd2c8-0146-41be-8207.png
-```
-
-### Step 3: Add Spine Images
-
-Create a `spines/` folder (if it doesn't exist) and put your spine images in it. **Name each file using the book ID** from step 2:
+Create a `spines/` folder and drop your spine images into it. **Name them whatever you want** — the server figures out which book each one belongs to.
 
 ```
 spines/
-├── li_8f7bd2c8-0146-41be-8207.png     ← spine for "1984"
-├── li_a2c3d4e5-f6g7-h8i9-j0k1.jpg     ← spine for "Dune"
-└── li_b3c4d5e6-g7h8-i9j0-k1l2.webp    ← spine for "The Hobbit"
+├── Dune.png
+├── The Hobbit.jpg
+├── Project Hail Mary.webp
+└── Frank Herbert - Children of Dune.png
 ```
 
-**Supported formats:** `.png`, `.jpg`, `.jpeg`, `.webp`
+The server matches filenames to books using your ABS library. It handles:
+- Exact titles: `Dune.png`
+- Titles with spaces, punctuation, apostrophes: `Ender's Game.png`
+- Underscores instead of spaces: `The_Great_Gatsby.png`
+- Author + title: `Frank Herbert - Dune.png`
+- Leading articles: `Hobbit.png` matches "The Hobbit"
+- Subtitles: `Dune.png` matches "Dune: Part One"
+
+On startup, the server tells you exactly what it matched:
+
+```
+Indexed 247 books (493 matchable keys)
+
+Matched 4 spine images:
+  Dune.png                                 → Dune (Frank Herbert)
+  The Hobbit.jpg                           → The Hobbit (J.R.R. Tolkien)
+  Project Hail Mary.webp                   → Project Hail Mary (Andy Weir)
+  Frank Herbert - Children of Dune.png     → Children of Dune (Frank Herbert)
+
+Could not match 1 files:
+  random_image.png
+  Tip: use --list-books to see valid titles, or rename to a book ID
+```
 
 > **Already have spine images in your audiobook folders?** If your book folders contain files named `spine.png` or `spine.jpg`, the server can find and import them automatically:
 > ```bash
@@ -191,7 +183,7 @@ spines/
 > LIBRARY_PATH=/path/to/audiobooks ABS_URL=... ABS_API_KEY=... python3 spine_server.py --scan-library
 > ```
 
-### Step 4: Start the Server
+### Step 3: Start the Server
 
 **With Docker:**
 ```bash
@@ -209,14 +201,14 @@ Verify it's running:
 ```bash
 # Health check
 curl http://localhost:8786/health
-# → {"status": "ok", "spines": 3}
+# → {"status": "ok", "spines": 4, "indexed_books": 247, "matchable_keys": 493}
 
 # Get the manifest (list of books with spines)
 curl http://localhost:8786/api/spines/manifest
-# → {"items": ["li_8f7bd2c8-...", "li_a2c3d4e5-...", ...], "count": 3, ...}
+# → {"items": ["li_8f7bd2c8-...", "li_a2c3d4e5-...", ...], "count": 4, ...}
 ```
 
-### Step 5: Connect the App
+### Step 4: Connect the App
 
 1. Open the app on your phone
 2. Go to **Settings** (profile tab)
@@ -228,6 +220,40 @@ curl http://localhost:8786/api/spines/manifest
 > **Finding your server IP:** This is the IP address of the machine running the spine server. On Linux/Mac, run `hostname -I` or `ifconfig`. On Windows, run `ipconfig`. It'll be something like `192.168.1.100`.
 
 > **Important:** Your phone must be able to reach this IP. If the spine server is on your home network, your phone needs to be on the same network (same WiFi).
+
+---
+
+## File Naming Guide
+
+The server matches filenames to books using multiple strategies, tried in order:
+
+| Priority | Naming Style | Example | How It Matches |
+|----------|-------------|---------|----------------|
+| 1 | Book ID | `li_8f7bd2c8.png` | Direct ID lookup (always works, even without ABS) |
+| 2 | Exact title | `Dune.png` | Normalized text comparison |
+| 3 | Author - Title | `Frank Herbert - Dune.png` | Splits on ` - ` and matches both parts |
+| 4 | Title with underscores | `The_Great_Gatsby.png` | Underscores treated as spaces |
+| 5 | Without subtitle | `Dune.png` | Matches "Dune: Part One" |
+| 6 | Without "The/A/An" | `Hobbit.png` | Matches "The Hobbit" |
+| 7 | Fuzzy containment | `Gatsby.png` | Matches if filename is contained in a title |
+
+**Normalization rules** (applied to both filenames and book titles):
+- Lowercased
+- Underscores, hyphens, dots → spaces
+- Punctuation removed (apostrophes, colons, etc.)
+- Unicode normalized (curly quotes → straight, accents → base letters)
+- Whitespace collapsed
+
+**When two books have the same title** (e.g., two different editions), the server skips the ambiguous match and logs a warning. Use the book ID for those.
+
+**To see what matched:** The server prints a full match report on startup.
+
+**To see all your books and valid names:**
+```bash
+python3 spine_server.py --list-books
+# or
+docker compose run --rm spine-server --list-books
+```
 
 ---
 
@@ -283,13 +309,13 @@ All configuration is done via environment variables. No config files needed.
 
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
-| `ABS_URL` | For `--list-books` and `--scan-library` | `http://localhost:13378` | Your AudiobookShelf server URL |
-| `ABS_API_KEY` | For `--list-books` and `--scan-library` | (empty) | ABS API token |
+| `ABS_URL` | Yes (for title matching) | `http://localhost:13378` | Your AudiobookShelf server URL |
+| `ABS_API_KEY` | Yes (for title matching) | (empty) | ABS API token |
 | `SPINES_DIR` | No | `./spines` | Folder containing your spine images |
 | `LIBRARY_PATH` | For `--scan-library` only | (empty) | Local path to your audiobook files |
 | `PORT` | No | `8786` | Port the server listens on |
 
-> **Note:** `ABS_URL` and `ABS_API_KEY` are NOT needed to run the server itself. They're only used by the `--list-books` and `--scan-library` helper commands. Once you have your spine images in the folder, the server runs independently.
+> **Without ABS_API_KEY:** The server still works, but files must be named by book ID (e.g., `li_abc123.png`). Title matching requires ABS access to know your book titles.
 
 ### Command-Line Arguments
 
@@ -297,7 +323,7 @@ All configuration is done via environment variables. No config files needed.
 python3 spine_server.py [OPTIONS]
 
 Options:
-  --list-books       Connect to ABS and print all books with their IDs
+  --list-books       Connect to ABS and print all books with their IDs/titles
   --scan-library     Find spine.png/jpg files in your audiobook folders
   --port PORT        Port to listen on (default: 8786)
   --spines-dir DIR   Folder containing spine images (default: ./spines)
@@ -318,6 +344,9 @@ services:
       - "8786:8786"
     volumes:
       - ./spines:/spines
+    environment:
+      ABS_URL: http://audiobookshelf:13378
+      ABS_API_KEY: "your-key-here"
 ```
 
 ### Alongside ABS (Same Docker Network)
@@ -435,7 +464,9 @@ Health check endpoint.
 ```json
 {
   "status": "ok",
-  "spines": 42
+  "spines": 42,
+  "indexed_books": 247,
+  "matchable_keys": 493
 }
 ```
 
@@ -443,14 +474,26 @@ Health check endpoint.
 
 ## Troubleshooting
 
-### "Cannot reach ABS" when running --list-books
+### "Cannot reach ABS" when starting the server
 
-**Cause:** The spine server can't connect to your ABS server.
+**Cause:** The spine server can't connect to your ABS server to build the book index.
 
 **Fix:**
 - Check that `ABS_URL` is correct — open it in a browser to verify
 - If both run in Docker, they must be on the same Docker network
 - If ABS runs on the host and the spine server runs in Docker, use `http://host.docker.internal:13378` as the URL
+- The server still works without ABS, but files must be named by book ID
+
+### "Could not match N files"
+
+The server found image files it couldn't match to any book in your library.
+
+**Common causes:**
+- Typo in the filename (check spelling against `--list-books` output)
+- The book title in ABS is different from what you expected
+- Two books have the same title (ambiguous — use book ID instead)
+
+**Fix:** Run `--list-books` to see exact titles, then rename your files to match.
 
 ### No spines showing in the app
 
@@ -474,7 +517,7 @@ Health check endpoint.
 This means the app either can't reach the spine server or the manifest is empty.
 
 1. Check `http://YOUR_SERVER_IP:8786/api/spines/manifest` — the `count` should be > 0
-2. Check that spine files are in the `spines/` folder with correct names (book IDs)
+2. Check the server startup log — did your files match?
 3. The server re-scans the folder every 30 seconds — wait a moment after adding new images
 
 ### How do I update spine images?
@@ -491,13 +534,18 @@ The spine server works anywhere — it doesn't need to be on the same machine as
 
 ### Architecture
 
-The spine server is intentionally simple — a single Python file with zero dependencies.
+The spine server is a single Python file with zero dependencies.
 
 ```
 spine_server.py
       │
+      ├── On startup: connects to ABS API
+      │   ├── Fetches all books (titles, authors, IDs)
+      │   └── Builds a title-matching index
+      │
       ├── Scans spines/ folder every 30 seconds
-      │   └── Builds a manifest (list of book IDs that have images)
+      │   ├── Matches filenames to books (by title, author, or ID)
+      │   └── Builds a manifest (list of matched book IDs)
       │
       ├── GET /api/spines/manifest
       │   └── Returns the manifest as JSON
@@ -506,8 +554,21 @@ spine_server.py
       │   └── Reads the image file from disk and sends it back
       │
       └── GET /health
-          └── Returns OK + spine count
+          └── Returns OK + spine count + index stats
 ```
+
+### Title Matching
+
+On startup, the server builds an index from your ABS library. For each book, it creates multiple lookup keys:
+
+| Book | Keys generated |
+|------|---------------|
+| "The Hobbit" by J.R.R. Tolkien | `the hobbit`, `jrr tolkien the hobbit`, `the hobbit jrr tolkien`, `hobbit` |
+| "Dune: Part One" by Frank Herbert | `dune part one`, `frank herbert dune part one`, `dune` |
+
+When scanning the spines folder, each filename is normalized the same way and looked up in the index. Normalization strips punctuation, lowercases, and collapses whitespace — so `The_Hobbit.png`, `the hobbit.png`, and `THE HOBBIT.PNG` all match the same book.
+
+If two books produce the same key (e.g., two editions of "Dune"), that key is marked ambiguous and skipped. Use the book ID for those cases.
 
 ### Why a Separate Server?
 
@@ -527,13 +588,9 @@ The spine server uses the same URL patterns that the app already expects:
 
 This means the app doesn't need special logic — it just talks to a different base URL.
 
-### File Naming
-
-Spine images are matched to books by their **ABS library item ID**. This is the `id` field from the ABS API, and it looks like `li_8f7bd2c8-0146-41be-8207-3a11456bd4b3`. The file extension can be `.png`, `.jpg`, `.jpeg`, or `.webp`.
-
 ### Auto-Refresh
 
-The server re-scans the `spines/` folder every 30 seconds. You can add, remove, or replace spine images at any time without restarting the server.
+The server re-scans the `spines/` folder every 30 seconds. You can add, remove, or replace spine images at any time without restarting the server. New files are automatically matched against the book index.
 
 ---
 
