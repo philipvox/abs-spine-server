@@ -1,0 +1,65 @@
+version: "3.8"
+
+# =============================================================================
+# Spine Server for AudiobookShelf
+#
+# Serves spine images so the app can display custom book spines.
+# Runs alongside your existing ABS container.
+#
+# QUICK START:
+#   1. Copy this file next to your ABS docker-compose.yml
+#   2. Set your ABS_API_KEY below
+#   3. Put spine images in ./spines/ (named by book ID, e.g. li_abc123.png)
+#   4. docker compose up -d
+#   5. In the app: Settings > Display > Spine Server URL > http://YOUR_IP:8786
+#
+# FINDING BOOK IDS:
+#   docker compose run --rm spine-server --list-books
+#
+# SCANNING FOR EXISTING SPINE IMAGES:
+#   (only if you have spine.png files in your audiobook folders)
+#   docker compose run --rm spine-server --scan-library
+# =============================================================================
+
+services:
+  spine-server:
+    build: .
+    # Or use a pre-built image:
+    # image: ghcr.io/your-username/abs-spine-server:latest
+    container_name: abs-spine-server
+    restart: unless-stopped
+    ports:
+      - "8786:8786"
+    volumes:
+      # Your spine images go here
+      - ./spines:/spines
+
+      # OPTIONAL: Mount your audiobook library (read-only) if you want
+      # to use --scan-library to find existing spine.png files.
+      # Uncomment and adjust the path to match your ABS library mount:
+      # - /path/to/your/audiobooks:/audiobooks:ro
+    environment:
+      # REQUIRED: Your ABS server URL (as seen from inside Docker)
+      # If ABS runs in Docker on the same machine, use the container name:
+      ABS_URL: http://audiobookshelf:13378
+      # If ABS runs on the host machine:
+      # ABS_URL: http://host.docker.internal:13378
+
+      # REQUIRED: Your ABS API key
+      # Get one from: ABS web UI > Settings > API Tokens > Create
+      ABS_API_KEY: ""
+
+      # OPTIONAL: Path to audiobook library INSIDE the container
+      # Only needed for --scan-library. Must match the volume mount above.
+      # LIBRARY_PATH: /audiobooks
+
+    # If your ABS is also in Docker, they need to be on the same network
+    # to talk to each other by container name.
+    # Uncomment and set the network name to match your ABS setup:
+    # networks:
+    #   - audiobookshelf_default
+
+# Uncomment if using a shared network with ABS:
+# networks:
+#   audiobookshelf_default:
+#     external: true
