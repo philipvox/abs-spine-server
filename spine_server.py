@@ -7,15 +7,24 @@ Designed to run alongside your AudiobookShelf instance.
 
 WHAT THIS DOES:
   1. Connects to your ABS server to learn about your books
-  2. Looks in a local folder for spine images you've created
-  3. Serves those images over HTTP so the app can display them
-  4. Generates a "manifest" (a list of which books have spines)
+  2. Looks in a local folder for spine images
+  3. Auto-matches images to books by TITLE or by ID
+  4. Serves those images over HTTP so the app can display them
+  5. Generates a "manifest" (a list of which books have spines)
+
+NAMING YOUR FILES:
+  You can name spine images however you want. The server figures it out:
+
+    By title:           Dune.png
+    By title (spaces):  The Hobbit.png
+    With author:        Frank Herbert - Dune.png
+    With underscores:   The_Great_Gatsby.png
+    By book ID:         li_8f7bd2c8.png           (always works, even without ABS)
 
 SETUP:
   1. Set your ABS server URL and API key (see below)
-  2. Put spine images in the "spines/" folder, named by book ID
-     (run with --list-books to see your book IDs)
-  3. Run this script
+  2. Put spine images in the "spines/" folder
+  3. Run this script — it auto-matches files to books
   4. In the app, go to Settings > Display > Spine Server URL
      and enter this server's address (e.g. http://192.168.1.100:8786)
 
@@ -29,9 +38,11 @@ Usage:
 """
 
 import os
+import re
 import sys
 import json
 import time
+import unicodedata
 import argparse
 import mimetypes
 import urllib.request
@@ -54,7 +65,7 @@ ABS_API_KEY = os.environ.get("ABS_API_KEY", "")
 DEFAULT_PORT = 8786
 
 # Folder where you put your spine images
-SPINES_DIR = os.environ.get("SPINES_DIR", os.path.join(os.path.dirname(__file__), "spines"))
+SPINES_DIR = os.environ.get("SPINES_DIR", os.path.join(os.path.dirname(__file__) or ".", "spines"))
 
 # If your audiobook files are accessible locally, set this to the root path.
 # This lets --scan-library find spine.png files inside book folders.
@@ -142,8 +153,199 @@ def get_all_books():
 
 
 # =============================================================================
+# TITLE MATCHING
+# =============================================================================
+
+def normalize(text):
+    """
+    Normalize a string for fuzzy comparison.
+
+    "The Hitchhiker's Guide to the Galaxy" → "hitchhikers guide to the galaxy"
+    "Frank Herbert - Dune"                 → "frank herbert dune"
+    "The_Great_Gatsby"                     → "the great gatsby"
+    "Ender\u2019s Game"                    → "enders game"
+    """
+    # Unicode normalize (curly quotes → straight, accents → base)
+    text = unicodedata.normalize("NFKD", text)
+    # Lowercase
+    text = text.lower()
+    # Replace underscores, hyphens, dots with spaces
+    text = re.sub(r"[_.\-]+", " ", text)
+    # Remove all punctuation (apostrophes, colons, commas, etc.)
+    text = re.sub(r"[^\w\s]", "", text)
+    # Collapse whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def build_title_index(books):
+    """
+    Build lookup tables for matching filenames to books.
+
+    Returns a dict of normalized_string → book_id.
+    Multiple keys can point to the same book to increase match chances.
+
+    For each book we index:
+      - title                        ("dune")
+      - author - title               ("frank herbert dune")
+      - title - author               ("dune frank herbert")
+      - title without leading "the"  ("hobbit" for "The Hobbit")
+      - title without subtitle       ("dune" for "Dune: Part One")
+    """
+    index = {}
+    collisions = {}  # track normalized keys that map to multiple books
+
+    def add(key, book_id, description):
+        if not key:
+            return
+        if key in index and index[key] != book_id:
+            # Collision — two books normalize to the same key. Mark as ambiguous.
+            collisions[key] = collisions.get(key, [index[key]])
+            collisions[key].append(book_id)
+            return
+        index[key] = book_id
+
+    for book in books:
+        bid = book["id"]
+        title = book["title"]
+        author = book["author"]
+        nt = normalize(title)
+        na = normalize(author)
+
+        # Title alone
+        add(nt, bid, "title")
+
+        # Author - Title  and  Title - Author
+        if na and na != "unknown":
+            add(f"{na} {nt}", bid, "author title")
+            add(f"{nt} {na}", bid, "title author")
+
+        # Without leading article
+        for article in ("the ", "a ", "an "):
+            if nt.startswith(article):
+                add(nt[len(article):], bid, "title without article")
+                break
+
+        # Without subtitle (split on colon or dash-surrounded-by-spaces)
+        for sep in [":", " - "]:
+            if sep in title:
+                base = normalize(title.split(sep)[0])
+                add(base, bid, "title without subtitle")
+
+    # Remove ambiguous keys
+    for key in collisions:
+        if key in index:
+            del index[key]
+
+    return index, collisions
+
+
+def match_filename_to_book(filename, title_index):
+    """
+    Try to match a filename (without extension) to a book ID.
+
+    Tries progressively looser matching:
+      1. Exact book ID (starts with "li_")
+      2. Exact normalized match
+      3. "Author - Title" split on " - "
+      4. Partial match (filename contained in a title key, or vice versa)
+
+    Returns (book_id, match_type) or (None, None).
+    """
+    # 1. Already a book ID
+    if filename.startswith("li_"):
+        return filename, "id"
+
+    nf = normalize(filename)
+    if not nf:
+        return None, None
+
+    # 2. Exact match
+    if nf in title_index:
+        return title_index[nf], "exact"
+
+    # 3. Try splitting "Author - Title" or "Title - Author"
+    for sep in [" - ", " — ", " – "]:
+        if sep in filename:
+            parts = filename.split(sep, 1)
+            for combo in [parts, reversed(parts)]:
+                combo = list(combo)
+                joined = normalize(" ".join(combo))
+                if joined in title_index:
+                    return title_index[joined], "author-title split"
+                # Try each part alone
+                for part in combo:
+                    np = normalize(part)
+                    if np in title_index:
+                        return title_index[np], "part match"
+
+    # 4. Containment — filename is a substring of a key or vice versa
+    #    Only if the shorter side is at least 5 chars (avoid false positives)
+    best_match = None
+    best_len = 0
+    for key, book_id in title_index.items():
+        if len(key) < 5 or len(nf) < 5:
+            continue
+        if nf in key or key in nf:
+            # Prefer the tighter match (less leftover)
+            overlap = min(len(nf), len(key))
+            if overlap > best_len:
+                best_len = overlap
+                best_match = book_id
+
+    if best_match:
+        return best_match, "fuzzy"
+
+    return None, None
+
+
+# =============================================================================
 # SPINE IMAGE MANAGEMENT
 # =============================================================================
+
+# Global book index (populated on startup if ABS is reachable)
+_title_index = {}
+_books_by_id = {}  # id → {title, author, ...} for logging
+_index_loaded = False
+_collisions = {}
+
+
+def load_book_index():
+    """
+    Fetch books from ABS and build the title matching index.
+    Called once on startup. If ABS is unreachable, falls back to ID-only mode.
+    """
+    global _title_index, _books_by_id, _index_loaded, _collisions
+
+    if not ABS_API_KEY:
+        print("No ABS_API_KEY set — running in ID-only mode.")
+        print("  Files must be named by book ID (e.g. li_abc123.png)")
+        print("  Set ABS_API_KEY to enable auto-matching by title.")
+        _index_loaded = True
+        return
+
+    print("Connecting to ABS to build book index...")
+    books = get_all_books()
+
+    if not books:
+        print("WARNING: Could not load books from ABS. Running in ID-only mode.")
+        _index_loaded = True
+        return
+
+    _title_index, _collisions = build_title_index(books)
+    _books_by_id = {b["id"]: b for b in books}
+    _index_loaded = True
+
+    print(f"Indexed {len(books)} books ({len(_title_index)} matchable keys)")
+
+    if _collisions:
+        print(f"  {len(_collisions)} ambiguous titles (skipped, use book IDs for these):")
+        for key in sorted(list(_collisions.keys())[:5]):
+            titles = [_books_by_id[bid]["title"] for bid in _collisions[key] if bid in _books_by_id]
+            print(f"    \"{key}\" matches: {', '.join(titles)}")
+        if len(_collisions) > 5:
+            print(f"    ... and {len(_collisions) - 5} more")
+
 
 def ensure_spines_dir():
     """Create the spines folder if it doesn't exist."""
@@ -155,12 +357,15 @@ def find_spine_files():
     Scan the spines/ folder for image files.
     Returns a dict: {book_id: file_path, ...}
 
-    Supported naming:
-      - li_abc123.png       (full ABS item ID)
-      - li_abc123.jpg
-      - li_abc123.webp
+    Files can be named:
+      - By book ID:    li_abc123.png         (always works)
+      - By title:      Dune.png              (matched via ABS)
+      - Author-title:  Frank Herbert - Dune.png
+      - Underscores:   The_Hobbit.png
     """
     spines = {}
+    unmatched = []
+
     if not os.path.isdir(SPINES_DIR):
         return spines
 
@@ -169,14 +374,26 @@ def find_spine_files():
         if not os.path.isfile(filepath):
             continue
 
-        # Strip extension to get the book ID
         name, ext = os.path.splitext(filename)
         ext_lower = ext.lower()
 
-        if ext_lower in (".png", ".jpg", ".jpeg", ".webp"):
-            spines[name] = filepath
+        if ext_lower not in (".png", ".jpg", ".jpeg", ".webp"):
+            continue
 
-    return spines
+        # Try to match this filename to a book
+        book_id, match_type = match_filename_to_book(name, _title_index)
+
+        if book_id:
+            if book_id in spines:
+                # Already have a spine for this book — prefer ID-named files
+                existing_name = os.path.basename(spines[book_id])
+                if match_type != "id" and existing_name.startswith("li_"):
+                    continue  # Keep the ID-named one
+            spines[book_id] = filepath
+        else:
+            unmatched.append(filename)
+
+    return spines, unmatched
 
 
 def scan_library_for_spines(books):
@@ -202,30 +419,22 @@ def scan_library_for_spines(books):
         abs_path = book["path"]  # e.g. /audiobooks/Author/Title
 
         # Try to find the book folder relative to LIBRARY_PATH
-        # ABS stores paths like /audiobooks/Author/Title
-        # We need to map that to the local filesystem
-        # Strategy: try the path as-is, then try just the last 2-3 segments
         candidates = [abs_path]
 
         parts = Path(abs_path).parts
         if len(parts) >= 2:
-            # Try last 2 parts (Author/Title)
             candidates.append(os.path.join(LIBRARY_PATH, *parts[-2:]))
         if len(parts) >= 3:
-            # Try last 3 parts (Library/Author/Title)
             candidates.append(os.path.join(LIBRARY_PATH, *parts[-3:]))
-        # Try full path under LIBRARY_PATH
         candidates.append(os.path.join(LIBRARY_PATH, abs_path.lstrip("/")))
 
         for folder in candidates:
             if not os.path.isdir(folder):
                 continue
 
-            # Look for spine image in this folder
             for spine_name in ["spine.png", "spine.jpg", "spine.jpeg", "spine.webp"]:
                 spine_path = os.path.join(folder, spine_name)
                 if os.path.isfile(spine_path):
-                    # Copy to spines/ folder named by book ID
                     ext = os.path.splitext(spine_name)[1]
                     dest = os.path.join(SPINES_DIR, f"{book['id']}{ext}")
 
@@ -246,14 +455,6 @@ def scan_library_for_spines(books):
 def build_manifest(spine_files):
     """
     Build the manifest JSON that tells the app which books have spines.
-
-    The manifest is just a list:
-      {
-        "items": ["li_abc123", "li_def456", ...],
-        "version": 1,
-        "count": 2,
-        "generated": "2026-03-23T12:00:00"
-      }
     """
     return {
         "items": sorted(spine_files.keys()),
@@ -292,8 +493,9 @@ class SpineHandler(BaseHTTPRequestHandler):
         """Re-scan the spines folder periodically to pick up new images."""
         now = time.time()
         if now - cls._last_scan > cls._scan_interval:
-            cls._spine_files = find_spine_files()
-            cls._manifest = build_manifest(cls._spine_files)
+            spines, unmatched = find_spine_files()
+            cls._spine_files = spines
+            cls._manifest = build_manifest(spines)
             cls._last_scan = now
 
     def do_GET(self):
@@ -310,8 +512,6 @@ class SpineHandler(BaseHTTPRequestHandler):
         # --- Spine image ---
         # Path: /api/items/{bookId}/spine
         if path.startswith("/api/items/") and path.endswith("/spine"):
-            # Extract book ID from the path
-            # /api/items/li_abc123/spine -> li_abc123
             parts = path.split("/")
             if len(parts) >= 4:
                 book_id = parts[3]
@@ -323,6 +523,8 @@ class SpineHandler(BaseHTTPRequestHandler):
             self.send_json({
                 "status": "ok",
                 "spines": len(self._spine_files) if self._spine_files else 0,
+                "indexed_books": len(_books_by_id),
+                "matchable_keys": len(_title_index),
             })
             return
 
@@ -344,15 +546,12 @@ class SpineHandler(BaseHTTPRequestHandler):
             self.send_error(500, "Could not read spine file")
             return
 
-        # Figure out the content type from the file extension
         content_type = mimetypes.guess_type(filepath)[0] or "image/png"
 
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
-        # Let the app cache this for a long time (1 week)
         self.send_header("Cache-Control", "public, max-age=604800")
-        # Allow requests from any origin (the app needs this)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(data)
@@ -394,10 +593,16 @@ def cmd_list_books():
     for book in sorted(books, key=lambda b: b["title"]):
         print(f"{book['id']:<30} {book['title'][:48]:<50} {book['author'][:30]}")
 
-    print(f"\n--- How to use these IDs ---")
-    print(f"Name your spine image files using the BOOK ID above.")
-    print(f"Put them in: {SPINES_DIR}/")
-    print(f"Example: {SPINES_DIR}/{books[0]['id']}.png")
+    print()
+    print("--- How to name your spine files ---")
+    print()
+    print("You can use ANY of these naming styles:")
+    print(f"  {SPINES_DIR}/Dune.png                       (just the title)")
+    print(f"  {SPINES_DIR}/Frank Herbert - Dune.png       (author - title)")
+    print(f"  {SPINES_DIR}/The_Hobbit.png                 (underscores for spaces)")
+    print(f"  {SPINES_DIR}/{books[0]['id']}.png   (book ID — always works)")
+    print()
+    print("The server auto-matches filenames to books when it starts.")
 
 
 def cmd_scan_library():
@@ -422,35 +627,58 @@ def cmd_serve(port):
     """Start the HTTP server."""
     ensure_spines_dir()
 
-    # Do initial scan
-    spine_files = find_spine_files()
+    # Build the title matching index from ABS
+    load_book_index()
+
+    # Do initial scan and match
+    spine_files, unmatched = find_spine_files()
     SpineHandler._spine_files = spine_files
     SpineHandler._manifest = build_manifest(spine_files)
     SpineHandler._last_scan = time.time()
 
-    print(f"=== Spine Server ===")
-    print(f"")
-    print(f"Serving {len(spine_files)} spine images")
-    print(f"Spines folder: {SPINES_DIR}")
-    print(f"")
-    print(f"Server running at: http://0.0.0.0:{port}")
-    print(f"")
-    print(f"--- App Setup ---")
-    print(f"In the app, go to:")
-    print(f"  Settings > Display > Spine Server URL")
-    print(f"Enter: http://YOUR_IP_ADDRESS:{port}")
-    print(f"")
-    print(f"--- Endpoints ---")
-    print(f"  GET /api/spines/manifest      - List of books with spines")
-    print(f"  GET /api/items/{{id}}/spine     - Get a spine image")
-    print(f"  GET /health                    - Server status")
-    print(f"")
+    print()
+    print("=== Spine Server ===")
+    print()
 
-    if len(spine_files) == 0:
-        print(f"WARNING: No spine images found in {SPINES_DIR}/")
-        print(f"  Run with --list-books to see your book IDs")
-        print(f"  Then put images named by ID in {SPINES_DIR}/")
-        print(f"")
+    # Show what matched
+    if spine_files:
+        print(f"Matched {len(spine_files)} spine images:")
+        for book_id, filepath in sorted(spine_files.items(), key=lambda x: x[1]):
+            filename = os.path.basename(filepath)
+            book = _books_by_id.get(book_id)
+            if book:
+                print(f"  {filename:<40} → {book['title']} ({book['author']})")
+            else:
+                print(f"  {filename:<40} → {book_id}")
+        print()
+
+    # Show what didn't match
+    if unmatched:
+        print(f"Could not match {len(unmatched)} files:")
+        for f in sorted(unmatched):
+            print(f"  {f}")
+        print("  Tip: use --list-books to see valid titles, or rename to a book ID")
+        print()
+
+    if not spine_files and not unmatched:
+        print(f"No spine images found in {SPINES_DIR}/")
+        print(f"  Add images named by title (e.g. Dune.png) or by book ID")
+        print(f"  Run with --list-books to see your books")
+        print()
+
+    print(f"Spines folder: {SPINES_DIR}")
+    print(f"Server running at: http://0.0.0.0:{port}")
+    print()
+    print("--- App Setup ---")
+    print("In the app, go to:")
+    print("  Settings > Display > Spine Server URL")
+    print(f"Enter: http://YOUR_IP_ADDRESS:{port}")
+    print()
+    print("--- Endpoints ---")
+    print("  GET /api/spines/manifest      - List of books with spines")
+    print("  GET /api/items/{id}/spine      - Get a spine image")
+    print("  GET /health                    - Server status")
+    print()
 
     server = HTTPServer(("0.0.0.0", port), SpineHandler)
 
@@ -475,6 +703,15 @@ def main():
         description="Spine Server for AudiobookShelf",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
+File Naming:
+  Name your spine images however you like. The server matches them
+  to your ABS books automatically:
+
+    Dune.png                         (title)
+    Frank Herbert - Dune.png         (author - title)
+    The_Hobbit.png                   (underscores = spaces)
+    li_8f7bd2c8.png                  (book ID — always works)
+
 Examples:
   # See your books and their IDs:
   python3 spine_server.py --list-books
