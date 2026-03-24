@@ -74,8 +74,7 @@ That's it. No `pip install`, no config files, no requirements.txt.
 - [Getting an API Key](#getting-an-api-key)
 - [File Naming](#file-naming)
 - [Server Output](#server-output)
-- [Creating Spine Images](#creating-spine-images)
-- [Configuration](#configuration)
+-[Configuration](#configuration)
 - [Docker](#docker)
 - [API Endpoints](#api-endpoints)
 - [Troubleshooting](#troubleshooting)
@@ -217,50 +216,6 @@ Enter: http://YOUR_IP_ADDRESS:8786
 ```
 
 Every matched file shows exactly which book it mapped to. Unmatched files are listed with a hint.
-
----
-
-## Creating Spine Images
-
-This server serves images — it doesn't create them. Here are some approaches.
-
-### Recommended specs
-
-| | Value |
-|---|---|
-| **Size** | 60–120 × 400–800 px (narrow and tall, like a real spine) |
-| **Format** | PNG or WebP preferred. JPG works. |
-| **Orientation** | Vertical — title reads top-to-bottom |
-
-### Approaches
-
-**By hand** — Photoshop, GIMP, Figma, Canva. Create a tall narrow canvas (80×600 works well), add the title vertically, pick colors from the book's cover.
-
-**Batch with Python + Pillow** — Loop through your library and render each title programmatically:
-
-```python
-from PIL import Image, ImageDraw, ImageFont
-
-def make_spine(title, width=80, height=600, bg="#2C1810", fg="#D4C5A9"):
-    img = Image.new("RGB", (width, height), bg)
-    draw = ImageDraw.Draw(img)
-    font = ImageFont.truetype("Georgia.ttf", 14)
-    # Draw title vertically rotated
-    txt_img = Image.new("RGB", (height, 40), bg)
-    txt_draw = ImageDraw.Draw(txt_img)
-    txt_draw.text((20, 8), title.upper(), fill=fg, font=font)
-    img.paste(txt_img.rotate(90, expand=True), (10, 0))
-    return img
-```
-
-**AI image generation** — Prompt: *"book spine for [title], narrow vertical image, library aesthetic, dark leather texture"*. Crop to the right aspect ratio.
-
-### Design tips
-
-- **Contrast matters** — the app may render spines as narrow as 40px. If you can't read it at that size, simplify.
-- **Match the cover** — pull 1–2 colors from the book's cover art for the spine background.
-- **Consistent heights** — books look best on the shelf when spines are similar heights. Pick a standard (e.g., 600px) and stick to it.
-- **Less is more** — title and maybe author name. No need for publisher logos or ISBNs.
 
 ---
 
