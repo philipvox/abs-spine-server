@@ -1,0 +1,16 @@
+# Spine images (user-generated, not part of the repo)
+spines/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# macOS
+.DS_Store
+._*
+
+# IDE
+.vscode/
+.idea/
