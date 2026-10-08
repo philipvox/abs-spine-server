@@ -247,6 +247,9 @@ python3 spine_server.py [OPTIONS]
   --port N         Listen on port N (default: 8786)
   --spines-dir D   Use D as the spines folder
   --no-open        Don't open the browser on startup
+  --import-community        Download curated community spines (see below)
+  --community-url URL       Community server (default: https://spines.mysecretlibrary.com)
+  --dry-run                 With --import-community: list what would be downloaded
 ```
 
 ### config.json
@@ -276,6 +279,31 @@ python3 spine_server.py --scan-library
 ```
 
 This walks every book folder, finds spine images, and copies them into `spines/` named by book ID.
+
+### Importing curated community spines
+
+Fill in spines for books you don't have one for yet, using the curated
+[Secret Spines](https://spines.mysecretlibrary.com) collection:
+
+```bash
+python3 spine_server.py --import-community --dry-run   # preview
+python3 spine_server.py --import-community             # download
+```
+
+Or click **Import curated community spines** in the web UI.
+
+- Uses the server's curated-only manifest (`/api/spines/manifest/v3`). Community
+  uploads are not included. If the server only offers the older v2 manifest, the
+  import stops and downloads nothing.
+- Matches your ABS books by **ASIN**, then **ISBN**, then a normalized
+  title+author hash, then the same fuzzy title matching used for file names.
+- Downloads only for books that have **no spine yet** (in any folder) into
+  `spines/community/<ABS item id>.webp`. Existing files are never overwritten, and
+  a spine you add yourself later always takes precedence over an imported one.
+- Safe to re-run: it only fetches what's still missing.
+
+You can also grab everything at once as a zip from
+`https://spines.mysecretlibrary.com/downloads/spines-curated.zip`.
 
 ---
 
