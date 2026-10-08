@@ -11,6 +11,8 @@ Usage:
   python3 spine_server.py --list-books   # Show all books with IDs
   python3 spine_server.py --scan-library # Find spine.png files in your ABS library
   python3 spine_server.py --no-open      # Start without opening browser
+  python3 spine_server.py --import-community [--dry-run] [--community-url URL]
+                                         # Download curated community spines
 """
 
 import os
@@ -27,6 +29,8 @@ import webbrowser
 import unicodedata
 import argparse
 import mimetypes
+import hashlib
+import urllib.parse
 import urllib.request
 import urllib.error
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -157,6 +161,9 @@ def pick_folder():
 # Global config (loaded at startup)
 _config = {}
 
+# Dashboard-triggered community import state
+_import_state = {"running": False, "message": "", "ok": True}
+
 
 # =============================================================================
 # ABS API HELPERS
@@ -204,6 +211,8 @@ def get_all_books(abs_url=None, api_key=None):
                 "title": meta.get("title", "Unknown"),
                 "author": meta.get("authorName", "Unknown"),
                 "path": item.get("path", ""),
+                "asin": meta.get("asin") or "",
+                "isbn": meta.get("isbn") or "",
                 "libraryId": lib_id,
                 "libraryName": lib_name,
             })
@@ -300,12 +309,15 @@ def build_title_index(books):
     return index, collisions
 
 
-def match_filename_to_book(filename, title_index):
+def match_filename_to_book(filename, title_index, books_by_id=None):
     """
     Match a filename (without extension) to a book ID.
     Returns (book_id, match_type) or (None, None).
     """
-    if filename.startswith("li_"):
+    if books_by_id is None:
+        books_by_id = _books_by_id
+    # Old ABS item ids look like li_xxxx; current ABS uses UUIDs.
+    if filename.startswith("li_") or filename in books_by_id:
         return filename, "id"
 
     nf = normalize(filename)
@@ -404,12 +416,21 @@ def ensure_spines_dir():
     os.makedirs(spines_dir, exist_ok=True)
 
 
+def get_community_dir():
+    """Folder that --import-community downloads into (<abs item id>.webp)."""
+    return os.path.join(_config.get("spines_dir", DEFAULT_SPINES_DIR), "community")
+
+
 def get_all_spine_dirs():
-    """Get list of all directories to scan for spine images."""
+    """Get list of all directories to scan for spine images.
+    The community folder is always last so local spines take precedence."""
     dirs = [_config.get("spines_dir", DEFAULT_SPINES_DIR)]
     for folder in _config.get("linked_folders", []):
         if folder not in dirs:
             dirs.append(folder)
+    community = get_community_dir()
+    if community not in dirs:
+        dirs.append(community)
     return dirs
 
 
@@ -420,10 +441,12 @@ def find_spine_files():
     """Scan all spine directories for image files. Returns (spines, unmatched)."""
     spines = {}
     unmatched = []
+    community = get_community_dir()
 
     for spine_dir in get_all_spine_dirs():
         if not os.path.isdir(spine_dir):
             continue
+        is_community = (spine_dir == community)
 
         for filename in os.listdir(spine_dir):
             filepath = os.path.join(spine_dir, filename)
@@ -437,12 +460,217 @@ def find_spine_files():
             book_id, match_type = match_filename_to_book(name, _title_index)
 
             if book_id:
-                if book_id not in spines or match_type == "id":
+                if is_community:
+                    # Imported spines only fill gaps — never shadow a local one.
+                    spines.setdefault(book_id, filepath)
+                elif book_id not in spines or match_type == "id":
                     spines[book_id] = filepath
             else:
                 unmatched.append(filename)
 
     return spines, unmatched
+
+
+# =============================================================================
+# COMMUNITY IMPORT (bulk curated spines from spines.mysecretlibrary.com)
+# =============================================================================
+
+DEFAULT_COMMUNITY_URL = "https://spines.mysecretlibrary.com"
+USER_AGENT = "abs-spine-server (+https://github.com/philipvox/abs-spine-server)"
+
+# Match strength, strongest first.
+MATCH_RANKS = {"asin": 0, "isbn": 1, "hash": 2, "title": 3}
+
+
+def community_hash(title, author):
+    """Replicates the community server's manifest hash exactly
+    (spine_community.py: manifest_title_author_hash / _normalize_for_hash):
+    lowercase -> strip -> NFKD -> drop combining marks -> keep only [a-z0-9],
+    then sha256("title|author")[:16]."""
+    def _norm(s):
+        s = (s or "").lower().strip()
+        s = unicodedata.normalize("NFKD", s)
+        s = "".join(c for c in s if not unicodedata.combining(c))
+        return re.sub(r"[^a-z0-9]", "", s)
+    key = _norm(title) + "|" + _norm(author)
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+
+
+def _norm_asin(v):
+    return (v or "").strip().upper()
+
+
+def _norm_isbn(v):
+    # Same cleaning the community server applies before storing ISBN keys.
+    return re.sub(r"[^0-9X]", "", (v or "").strip().upper())
+
+
+def match_community_spines(entries, books):
+    """
+    Match community manifest entries to ABS books.
+    Order: ASIN, then ISBN, then title|author hash, then the local fuzzy
+    title matcher. Returns ({book_id: (entry, match_type)}, unmatched_entries).
+    When several entries hit one book the strongest match wins.
+    """
+    by_asin, by_isbn, by_hash = {}, {}, {}
+    for b in books:
+        a = _norm_asin(b.get("asin"))
+        if a:
+            by_asin.setdefault(a, b["id"])
+        i = _norm_isbn(b.get("isbn"))
+        if i:
+            by_isbn.setdefault(i, b["id"])
+        by_hash.setdefault(community_hash(b.get("title", ""), b.get("author", "")), b["id"])
+
+    title_index, _ = build_title_index(books)
+    no_ids = {}  # never let a community title masquerade as an item id
+
+    matches = {}
+    unmatched = []
+    for e in entries:
+        hit = None
+        a = _norm_asin(e.get("asin"))
+        i = _norm_isbn(e.get("isbn"))
+        if a and a in by_asin:
+            hit = (by_asin[a], "asin")
+        elif i and i in by_isbn:
+            hit = (by_isbn[i], "isbn")
+        elif e.get("hash") and e["hash"] in by_hash:
+            hit = (by_hash[e["hash"]], "hash")
+        else:
+            name = e.get("title", "")
+            if e.get("author"):
+                name = f"{e['author']} - {name}"
+            bid, _mt = match_filename_to_book(name, title_index, no_ids)
+            if bid:
+                hit = (bid, "title")
+        if not hit:
+            unmatched.append(e)
+            continue
+        bid, mtype = hit
+        prev = matches.get(bid)
+        if prev is None or MATCH_RANKS[mtype] < MATCH_RANKS[prev[1]]:
+            matches[bid] = (e, mtype)
+    return matches, unmatched
+
+
+def _http_get(url, timeout=30):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read(), resp.headers.get("Content-Type", "")
+
+
+def fetch_community_manifest(base_url, http_get=_http_get):
+    """Return the v3 (curated-only) spine list, or None with a message if the
+    server does not offer v3. v2 is deliberately NOT used: it includes
+    community uploads that have no licence terms."""
+    base = base_url.rstrip("/")
+    try:
+        body, _ = http_get(f"{base}/api/spines/manifest/v3")
+        data = json.loads(body.decode("utf-8"))
+        return data.get("spines", []), None
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            return None, f"Manifest v3 request failed: HTTP {e.code}"
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return None, f"Could not fetch manifest v3 from {base}: {e}"
+    # v3 missing — check whether this is an older server with only v2.
+    try:
+        http_get(f"{base}/api/spines/manifest/v2")
+        return None, (f"{base} only offers manifest v2, which mixes in community "
+                      "uploads without licence terms. Bulk import needs the "
+                      "curated-only manifest v3 — skipping, nothing imported.")
+    except Exception:
+        return None, f"{base} has no spine manifest (v3 or v2) — nothing imported."
+
+
+def import_community_spines(community_url=DEFAULT_COMMUNITY_URL, dry_run=False,
+                            books=None, http_get=_http_get, log=print):
+    """
+    Download curated community spines for ABS books that have no local spine.
+    Files go to spines/community/<abs item id>.<ext>; nothing is overwritten.
+    Returns a summary dict.
+    """
+    global _title_index, _books_by_id, _collisions
+    summary = {"ok": False, "manifest": 0, "matched": 0, "downloaded": 0,
+               "would_download": 0, "skipped_existing": 0, "failed": 0,
+               "unmatched": 0, "by_type": {}, "message": ""}
+
+    if books is None:
+        books = get_all_books()
+    if not books:
+        summary["message"] = "No books from ABS — check abs_url / abs_api_key."
+        log(summary["message"])
+        return summary
+
+    entries, err = fetch_community_manifest(community_url, http_get)
+    if entries is None:
+        summary["message"] = err
+        log(err)
+        return summary
+    summary["manifest"] = len(entries)
+
+    # Index ABS books so the existing scanner can tell which books already
+    # have a spine (any folder, any naming scheme).
+    with _lock:
+        _title_index, _collisions = build_title_index(books)
+        _books_by_id = {b["id"]: b for b in books}
+    existing, _ = find_spine_files()
+
+    matches, unmatched = match_community_spines(entries, books)
+    summary["matched"] = len(matches)
+    summary["unmatched"] = len(unmatched)
+
+    community_dir = get_community_dir()
+    if not dry_run:
+        os.makedirs(community_dir, exist_ok=True)
+    base = community_url.rstrip("/")
+
+    for bid, (entry, mtype) in sorted(matches.items()):
+        summary["by_type"][mtype] = summary["by_type"].get(mtype, 0) + 1
+        already = bid in existing or any(
+            os.path.exists(os.path.join(community_dir, bid + ext)) for ext in IMAGE_EXTS)
+        if already:
+            summary["skipped_existing"] += 1
+            continue
+        book = _books_by_id.get(bid, {})
+        if dry_run:
+            summary["would_download"] += 1
+            log(f"  [dry-run] {book.get('title', bid)} <- {entry.get('title')} ({mtype})")
+            continue
+        try:
+            data, ctype = http_get(f"{base}/api/spine/{urllib.parse.quote(entry['sid'])}")
+        except Exception as e:
+            summary["failed"] += 1
+            log(f"  FAILED {book.get('title', bid)}: {e}")
+            continue
+        ext = mimetypes.guess_extension((ctype or "").split(";")[0].strip()) or ".webp"
+        if ext not in IMAGE_EXTS:
+            ext = ".webp"
+        dest = os.path.join(community_dir, bid + ext)
+        if os.path.exists(dest):  # never overwrite
+            summary["skipped_existing"] += 1
+            continue
+        tmp = dest + ".part"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, dest)
+        summary["downloaded"] += 1
+        log(f"  + {book.get('title', bid)} ({mtype})")
+
+    summary["ok"] = True
+    bt = ", ".join(f"{k} {v}" for k, v in sorted(summary["by_type"].items(),
+                                                     key=lambda kv: MATCH_RANKS[kv[0]]))
+    action = (f"would download {summary['would_download']}" if dry_run
+              else f"downloaded {summary['downloaded']}")
+    summary["message"] = (
+        f"Community manifest: {summary['manifest']} curated spines. "
+        f"Matched {summary['matched']} of your books ({bt or 'none'}); "
+        f"{action}, skipped {summary['skipped_existing']} that already have a spine, "
+        f"{summary['unmatched']} community spines not in your library"
+        + (f", {summary['failed']} failed" if summary["failed"] else "") + ".")
+    log(summary["message"])
+    return summary
 
 
 def scan_library_for_spines(books):
@@ -660,6 +888,14 @@ body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:var(--
       </details>
     </div>
 
+    <!-- Community import -->
+    <div class="card">
+      <h2>Community Spines</h2>
+      <span class="help" style="margin-top:0;margin-bottom:12px">Download the curated Secret Library spines for books that don't have a spine yet. Your own spines are never replaced.</span>
+      <button class="btn btn-sec" id="imp-btn" onclick="importCommunity()" style="width:100%">Import curated community spines</button>
+      <div id="imp-msg" class="result hide" style="margin-top:8px"></div>
+    </div>
+
     <!-- Matched -->
     <div class="card">
       <div class="card-hdr" onclick="tog('matched')">
@@ -775,6 +1011,11 @@ function render(){
     });
   }else{uc.style.display='none'}
 
+  // Community import
+  const ib=document.getElementById('imp-btn'),im=document.getElementById('imp-msg');
+  ib.disabled=!!S.import_running;
+  if(S.import_message){im.className='result '+(S.import_running?'load':(S.import_ok?'ok':'err'));im.textContent=S.import_message}
+
   // Settings
   document.getElementById('d-url').value=S.abs_url||'';
   document.getElementById('d-key').placeholder=S.abs_api_key_masked||'';
@@ -846,6 +1087,14 @@ async function addFolder(){
 
 async function rmFolder(p){
   await api('/api/ui/action',{action:'remove_folder',path:p});
+  await load();
+}
+
+async function importCommunity(){
+  const im=document.getElementById('imp-msg');
+  im.className='result load';im.textContent='Starting import...';
+  const r=await api('/api/ui/action',{action:'import_community'});
+  if(!r.ok){im.className='result err';im.textContent=r.message}
   await load();
 }
 
@@ -1005,6 +1254,13 @@ class SpineHandler(BaseHTTPRequestHandler):
                 else:
                     self.send_json({"ok": False, "cancelled": True, "message": "No folder selected."})
 
+            elif action == "import_community":
+                if _import_state["running"]:
+                    self.send_json({"ok": False, "message": "Import already running."})
+                else:
+                    threading.Thread(target=_run_ui_import, daemon=True).start()
+                    self.send_json({"ok": True, "message": "Import started."})
+
             elif action == "rescan":
                 threading.Thread(target=reload_index, daemon=True).start()
                 self.send_json({"ok": True})
@@ -1065,7 +1321,11 @@ class SpineHandler(BaseHTTPRequestHandler):
                     and os.path.splitext(f)[1].lower() in IMAGE_EXTS
                 ])
             is_default = (d == _config.get("spines_dir", DEFAULT_SPINES_DIR))
-            folders.append({"path": d, "count": count, "removable": not is_default})
+            is_community = (d == get_community_dir())
+            if is_community and not os.path.isdir(d):
+                continue
+            folders.append({"path": d, "count": count,
+                            "removable": not (is_default or is_community)})
 
         matched_items = []
         for book_id, filepath in sorted(spines.items(), key=lambda x: x[1]):
@@ -1094,6 +1354,9 @@ class SpineHandler(BaseHTTPRequestHandler):
             "unmatched_items": sorted(unmatched),
             "folders": folders,
             "spines_dir": _config.get("spines_dir", DEFAULT_SPINES_DIR),
+            "import_running": _import_state["running"],
+            "import_message": _import_state["message"],
+            "import_ok": _import_state["ok"],
         }
 
     def log_message(self, format, *args):
@@ -1134,6 +1397,32 @@ def cmd_scan_library():
     if found > 0:
         spines_dir = _config.get("spines_dir", DEFAULT_SPINES_DIR)
         print(f"Copied to: {spines_dir}/")
+
+
+def _run_ui_import():
+    """Run the community import from the dashboard (background thread)."""
+    _import_state.update(running=True, message="Importing curated community spines...")
+    try:
+        r = import_community_spines(_config.get("community_url", DEFAULT_COMMUNITY_URL))
+        _import_state.update(message=r["message"], ok=r["ok"])
+    except Exception as e:
+        _import_state.update(message=f"Import failed: {e}", ok=False)
+    finally:
+        _import_state["running"] = False
+        SpineHandler._last_scan = 0
+
+
+def cmd_import_community(community_url, dry_run=False):
+    """Bulk-import curated community spines into spines/community/."""
+    print("Fetching books from ABS...")
+    books = get_all_books()
+    if not books:
+        print("No books found — check abs_url / abs_api_key (config.json or env).")
+        sys.exit(1)
+    print(f"Found {len(books)} books. Fetching curated manifest from {community_url} ...")
+    result = import_community_spines(community_url, dry_run=dry_run, books=books)
+    if not result["ok"]:
+        sys.exit(1)
 
 
 def cmd_serve(port, open_browser=True):
@@ -1215,6 +1504,12 @@ def main():
                         help="Folder containing spine images")
     parser.add_argument("--no-open", action="store_true",
                         help="Don't open the browser on startup")
+    parser.add_argument("--import-community", action="store_true",
+                        help="Download curated community spines for books with no local spine")
+    parser.add_argument("--community-url", type=str, default=DEFAULT_COMMUNITY_URL,
+                        help=f"Community spine server (default: {DEFAULT_COMMUNITY_URL})")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="With --import-community: show what would be downloaded")
 
     args = parser.parse_args()
 
@@ -1231,6 +1526,8 @@ def main():
         cmd_list_books()
     elif args.scan_library:
         cmd_scan_library()
+    elif args.import_community:
+        cmd_import_community(args.community_url, args.dry_run)
     else:
         cmd_serve(_config.get("port", DEFAULT_PORT), open_browser=not args.no_open)
 
