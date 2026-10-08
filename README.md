@@ -24,28 +24,29 @@ spines/
 └── li_8f7bd2c8.png                 ← book ID works too
 ```
 
-The server connects to your ABS instance, learns your books, and auto-matches filenames to the right book. No manual ID lookups. No config files. Just name the image something reasonable and it figures it out.
+The server connects to your ABS instance, learns your books, and auto-matches filenames to the right book. No manual ID lookups. Just name the image something reasonable and it figures it out.
+
+**New:** Built-in web UI for setup and management — no terminal required after first launch.
 
 ---
 
-## 3-Step Quick Start
+## Quick Start
 
-**1. Clone and add images**
-```bash
-git clone https://github.com/philipvox/abs-spine-server.git
-cd abs-spine-server
-mkdir spines
-# Drop your spine images into spines/ — name them by book title
-```
+### Option A: Double-click and go (recommended for beginners)
 
-**2. Start the server**
+1. [Download](https://github.com/philipvox/abs-spine-server/archive/refs/heads/main.zip) and unzip
+2. Put spine images in the `spines/` folder (name them by book title)
+3. Run `python3 spine_server.py` — your browser opens automatically
+4. Enter your ABS URL and API key in the setup page, click **Save & Start**
+5. Copy the app URL shown on the dashboard into your phone app
+
+### Option B: Environment variables (Docker / advanced)
 
 <table>
 <tr><th>Docker</th><th>Python</th></tr>
 <tr><td>
 
 ```bash
-# Set your ABS_API_KEY in docker-compose.yml, then:
 docker compose up -d
 ```
 
@@ -54,31 +55,51 @@ docker compose up -d
 ```bash
 ABS_URL=http://your-abs:13378 \
 ABS_API_KEY=your-key \
-python3 spine_server.py
+python3 spine_server.py --no-open
 ```
 
 </td></tr>
 </table>
 
-**3. Tell the app**
+### Option C: Docker Desktop Extension
 
-Settings → Display → Server Spines → **ON** → enter `http://YOUR_IP:8786`
-
-That's it. No `pip install`, no config files, no requirements.txt.
+See [`docker-extension/README.md`](docker-extension/README.md) for one-click install via Docker Desktop.
 
 ---
 
 ## Table of Contents
 
+- [Web UI](#web-ui)
 - [How It Works](#how-it-works)
 - [Getting an API Key](#getting-an-api-key)
 - [File Naming](#file-naming)
-- [Server Output](#server-output)
--[Configuration](#configuration)
+- [Linked Folders](#linked-folders)
+- [Configuration](#configuration)
 - [Docker](#docker)
+- [Docker Desktop Extension](#docker-desktop-extension)
 - [API Endpoints](#api-endpoints)
 - [Troubleshooting](#troubleshooting)
 - [Architecture](#architecture)
+
+---
+
+## Web UI
+
+The server includes a built-in web dashboard at `http://localhost:8786`. No extra software needed.
+
+**First launch** — opens a setup wizard:
+- Enter your ABS URL and API key
+- Test the connection
+- Click Save & Start
+
+**After setup** — shows a management dashboard:
+- **App URL** with one-click copy — paste into your phone app
+- **Live stats** — books indexed, spines matched, unmatched files
+- **Linked folders** — point to any folder on your computer containing spine images
+- **Match list** — see exactly which file mapped to which book
+- **Settings** — update ABS connection at any time
+
+The dashboard auto-refreshes every 5 seconds. Drop new images into any linked folder and watch them appear.
 
 ---
 
@@ -92,7 +113,7 @@ That's it. No `pip install`, no config files, no requirements.txt.
                     │   Spine Server    │──────▶│  ABS Server  │
                     │                   │ fetch │              │
                     │  1. Gets book list│ books │  "Here are   │
-                    │  2. Scans spines/ │◀──────│   247 books" │
+                    │  2. Scans folders │◀──────│   247 books" │
                     │  3. Matches names │       └──────────────┘
                     │     to books      │
                     │  4. Serves images │
@@ -100,15 +121,15 @@ That's it. No `pip install`, no config files, no requirements.txt.
                               │
               ┌───────────────┼───────────────┐
               ▼               ▼               ▼
-        /api/spines/    /api/items/     /health
+        /api/spines/    /api/items/     / (Web UI)
         manifest        {id}/spine
-        (JSON list)     (image file)    (status)
+        (JSON list)     (image file)    (dashboard)
 ```
 
 1. **Startup** — connects to ABS, fetches every book's title, author, and ID. Builds a matching index.
-2. **Matching** — scans `spines/` folder and fuzzy-matches each filename to a book. `Dune.png` → finds the book titled "Dune" → maps it to `li_8f7bd2c8`.
+2. **Matching** — scans all spine folders and fuzzy-matches each filename to a book. `Dune.png` → finds the book titled "Dune" → maps it to `li_8f7bd2c8`.
 3. **Serving** — the app asks for spines by book ID. The server looks up the matched file and sends it back.
-4. **Live reload** — re-scans the folder every 30 seconds. Drop in new images anytime.
+4. **Live reload** — re-scans folders every 30 seconds. Drop in new images anytime.
 
 ---
 
@@ -121,7 +142,7 @@ The server needs to read your book list from ABS. It uses an API key — a read-
 3. Scroll to **API Tokens** → click **Create**
 4. Copy the token
 
-Pass it to the server via the `ABS_API_KEY` environment variable.
+You can enter it in the web UI setup page, or pass it via the `ABS_API_KEY` environment variable.
 
 > Without an API key, the server still runs — but files must be named by book ID (`li_abc123.png`) since it can't look up titles.
 
@@ -159,19 +180,9 @@ The server tries these strategies in order and uses the first match:
 6. **Without article** — strips leading The/A/An
 7. **Containment** — filename is a substring of a title or vice versa (min 5 chars)
 
-### Normalization
-
-Applied to both filenames and book titles before comparison:
-
-- Lowercased
-- `_`, `-`, `.` → space
-- All punctuation removed (`'`, `:`, `,`, `!`, etc.)
-- Unicode normalized (curly quotes → straight, `é` → `e`)
-- Whitespace collapsed and trimmed
-
 ### Ambiguous titles
 
-If two books normalize to the same title (e.g., two editions of "Dune"), that key is marked ambiguous and skipped — neither book matches by title. The server logs which titles are ambiguous. Use the book ID for those.
+If two books normalize to the same title (e.g., two editions of "Dune"), that key is marked ambiguous and skipped — neither book matches by title. The web UI shows which titles are ambiguous. Use the book ID for those.
 
 ### Finding your books
 
@@ -181,54 +192,48 @@ python3 spine_server.py --list-books
 docker compose run --rm spine-server --list-books
 ```
 
-Prints every book with its ID, title, and author.
-
 ---
 
-## Server Output
+## Linked Folders
 
-On startup, the server prints a match report:
+Instead of copying images into `spines/`, you can point the server at any folder on your computer.
 
-```
-Connecting to ABS to build book index...
-Indexed 247 books (493 matchable keys)
+**Via the web UI:**
+1. Open the dashboard (`http://localhost:8786`)
+2. Under **Spine Folders**, paste a folder path and click **Link Folder**
+3. The server immediately scans it and matches any images it finds
 
-=== Spine Server ===
-
-Matched 5 spine images:
-  Dune.png                                 → Dune (Frank Herbert)
-  The Hobbit.jpg                           → The Hobbit (J.R.R. Tolkien)
-  Project Hail Mary.webp                   → Project Hail Mary (Andy Weir)
-  Frank Herbert - Children of Dune.png     → Children of Dune (Frank Herbert)
-  li_c9d0e1f2.png                          → li_c9d0e1f2
-
-Could not match 1 files:
-  vacation_photo.png
-  Tip: use --list-books to see valid titles, or rename to a book ID
-
-Spines folder: /spines
-Server running at: http://0.0.0.0:8786
-
---- App Setup ---
-In the app, go to:
-  Settings > Display > Spine Server URL
-Enter: http://YOUR_IP_ADDRESS:8786
+**Via config.json:**
+```json
+{
+  "linked_folders": [
+    "/Users/me/Art/book-spines",
+    "/mnt/nas/spines"
+  ]
+}
 ```
 
-Every matched file shows exactly which book it mapped to. Unmatched files are listed with a hint.
+You can link as many folders as you want. The server scans all of them plus the default `spines/` folder. If the same book is matched in multiple folders, the first match wins (default folder has priority).
 
 ---
 
 ## Configuration
 
-All via environment variables. No config files.
+Configuration is loaded in this priority order (higher overrides lower):
+
+1. **CLI arguments** (`--port`, `--spines-dir`)
+2. **Environment variables** (`ABS_URL`, `ABS_API_KEY`, etc.)
+3. **config.json** (created by the web UI, or by hand)
+4. **Defaults**
+
+### Environment variables
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ABS_URL` | `http://localhost:13378` | Your ABS server address |
+| `ABS_URL` | *(empty)* | Your ABS server address |
 | `ABS_API_KEY` | *(empty)* | ABS API token ([how to get one](#getting-an-api-key)) |
-| `SPINES_DIR` | `./spines` | Folder with your spine images |
-| `LIBRARY_PATH` | *(empty)* | Local path to audiobook files (only for `--scan-library`) |
+| `SPINES_DIR` | `./spines` | Default folder for spine images |
+| `LIBRARY_PATH` | *(empty)* | Path to audiobook files (only for `--scan-library`) |
 | `PORT` | `8786` | HTTP port |
 
 ### CLI
@@ -236,19 +241,34 @@ All via environment variables. No config files.
 ```
 python3 spine_server.py [OPTIONS]
 
-  (no args)        Start the server
+  (no args)        Start the server and open the web UI
   --list-books     Print all books with IDs and titles
   --scan-library   Import spine.png files from audiobook folders into spines/
   --port N         Listen on port N (default: 8786)
   --spines-dir D   Use D as the spines folder
+  --no-open        Don't open the browser on startup
 ```
+
+### config.json
+
+Created automatically by the web UI when you save settings. You can also create it by hand:
+
+```json
+{
+  "abs_url": "http://192.168.1.50:13378",
+  "abs_api_key": "your-key-here",
+  "port": 8786,
+  "linked_folders": []
+}
+```
+
+> **Note:** `config.json` is gitignored since it contains your API key.
 
 ### Importing existing spines
 
 If your audiobook folders already contain `spine.png` or `spine.jpg` files:
 
 ```bash
-# Set LIBRARY_PATH to where your audiobook files live on this machine
 LIBRARY_PATH=/path/to/audiobooks \
 ABS_URL=http://your-abs:13378 \
 ABS_API_KEY=your-key \
@@ -325,28 +345,6 @@ services:
     env_file: .env
 ```
 
-### With library scanning
-
-Mount your audiobook library to import existing spine files:
-
-```yaml
-services:
-  spine-server:
-    build: .
-    restart: unless-stopped
-    ports:
-      - "8786:8786"
-    volumes:
-      - ./spines:/spines
-      - /path/to/audiobooks:/audiobooks:ro   # read-only
-    environment:
-      ABS_URL: http://audiobookshelf:13378
-      ABS_API_KEY: your-key-here
-      LIBRARY_PATH: /audiobooks
-```
-
-Then run: `docker compose run --rm spine-server --scan-library`
-
 ### Health check
 
 The Docker image includes a built-in health check (`/health` endpoint, every 30s). Check status with:
@@ -357,13 +355,40 @@ docker inspect --format='{{.State.Health.Status}}' abs-spine-server
 
 ---
 
+## Docker Desktop Extension
+
+For Docker Desktop users, the spine server is available as a one-click extension.
+
+### Install
+
+```bash
+# Build from source
+docker build -t abs-spine-server-extension ./docker-extension
+docker extension install abs-spine-server-extension
+```
+
+### Usage
+
+1. Open Docker Desktop
+2. Click **ABS Spine Server** in the left sidebar
+3. Click **Open Spine Server UI** — the web setup wizard opens
+4. Enter your ABS URL and API key, link your spine folders, done
+
+See [`docker-extension/README.md`](docker-extension/README.md) for full details.
+
+---
+
 ## API Endpoints
 
-Three endpoints, no authentication required.
+Three public endpoints (no authentication required), plus the web UI.
+
+### `GET /`
+
+The web UI dashboard. Setup wizard on first visit, management dashboard after.
 
 ### `GET /api/spines/manifest`
 
-Returns which books have spine images. The app calls this once at startup so it only requests spines for books that have them.
+Returns which books have spine images.
 
 ```json
 {
@@ -417,7 +442,7 @@ The server found images it can't match to any book.
 
 - **Typo?** Run `--list-books` and compare exact titles.
 - **Different title in ABS?** ABS might store "The Lord of the Rings: The Fellowship of the Ring" while you named the file `Fellowship.png`. Try the full title or add more of it.
-- **Ambiguous?** Two books with the same title. The server logs these. Use the book ID.
+- **Ambiguous?** Two books with the same title. The web UI shows these. Use the book ID.
 </details>
 
 <details>
@@ -443,7 +468,7 @@ The app falls back to procedurally generated spines when it can't load server sp
 <details>
 <summary><strong>How do I update a spine image?</strong></summary>
 
-Replace the file in `spines/`. The server picks it up within 30 seconds. Pull down to refresh in the app.
+Replace the file in your spines folder. The server picks it up within 30 seconds. Pull down to refresh in the app.
 </details>
 
 <details>
@@ -456,25 +481,30 @@ Yes. Set `ABS_URL` to your ABS server's address (public URL or private IP). The 
 
 ## Architecture
 
-Single Python file. Zero dependencies. ~500 lines.
+Single Python file. Zero dependencies. Built-in web UI.
 
 ```
 spine_server.py
 │
 ├─ Startup
+│  ├─ Load config.json (or env vars)
 │  ├─ GET /api/libraries          → list of libraries
 │  ├─ GET /api/libraries/{id}/items → all books per library
-│  └─ Build title index            → normalized keys → book IDs
+│  ├─ Build title index            → normalized keys → book IDs
+│  └─ Open browser to web UI
 │
 ├─ Every 30 seconds
-│  ├─ Scan spines/ folder
+│  ├─ Scan all spine folders (default + linked)
 │  ├─ Match each filename → title index → book ID
 │  └─ Rebuild manifest
 │
-└─ HTTP Server (stdlib http.server)
-   ├─ /api/spines/manifest   → JSON manifest
-   ├─ /api/items/{id}/spine  → image file from disk
-   └─ /health                → status JSON
+└─ HTTP Server (stdlib ThreadingHTTPServer)
+   ├─ /                        → web UI (setup wizard / dashboard)
+   ├─ /api/spines/manifest     → JSON manifest
+   ├─ /api/items/{id}/spine    → image file from disk
+   ├─ /api/ui/status           → dashboard data (JSON)
+   ├─ /api/ui/action           → config changes (POST)
+   └─ /health                  → status JSON
 ```
 
 ### Why separate from ABS?
