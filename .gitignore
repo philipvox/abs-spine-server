@@ -1,6 +1,9 @@
 # Spine images (user-generated, not part of the repo)
 spines/
 
+# Config (contains API key)
+config.json
+
 # Python
 __pycache__/
 *.pyc
