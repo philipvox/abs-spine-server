@@ -170,6 +170,7 @@ _config = {}
 
 # Dashboard-triggered community import state
 _import_state = {"running": False, "message": "", "ok": True}
+_import_lock = threading.Lock()  # held for the whole duration of an import
 
 
 # =============================================================================
@@ -1651,9 +1652,8 @@ class SpineHandler(BaseHTTPRequestHandler):
             return {"ok": True}
 
         if action == "import_community":
-            if _import_state["running"]:
+            if not start_ui_import():
                 return {"ok": False, "message": "Import already running."}
-            threading.Thread(target=_run_ui_import, daemon=True).start()
             return {"ok": True, "message": "Import started."}
 
         if action == "rescan":
@@ -1812,9 +1812,25 @@ def cmd_scan_library():
         print(f"Copied to: {spines_dir}/")
 
 
+def start_ui_import():
+    """Start a dashboard import unless one is already running. The lock is
+    taken here, before the thread is spawned, so two clicks can't both win."""
+    if not _import_lock.acquire(blocking=False):
+        return False
+    _import_state.update(running=True, ok=True,
+                         message="Importing curated community spines...")
+    try:
+        threading.Thread(target=_run_ui_import, daemon=True).start()
+    except Exception:
+        _import_state["running"] = False
+        _import_lock.release()
+        raise
+    return True
+
+
 def _run_ui_import():
-    """Run the community import from the dashboard (background thread)."""
-    _import_state.update(running=True, message="Importing curated community spines...")
+    """Run the community import from the dashboard (background thread).
+    Must only be started by start_ui_import(), which holds _import_lock."""
     try:
         r = import_community_spines(_config.get("community_url", DEFAULT_COMMUNITY_URL))
         _import_state.update(message=r["message"], ok=r["ok"])
@@ -1823,6 +1839,7 @@ def _run_ui_import():
     finally:
         _import_state["running"] = False
         SpineHandler._last_scan = 0
+        _import_lock.release()
 
 
 def cmd_import_community(community_url, dry_run=False):
