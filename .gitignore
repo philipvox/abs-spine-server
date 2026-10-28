@@ -17,3 +17,6 @@ __pycache__/
 # IDE
 .vscode/
 .idea/
+
+# Docker data volume (config.json with your API key)
+data/
