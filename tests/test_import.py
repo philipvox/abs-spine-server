@@ -217,5 +217,62 @@ class CommunityTitleFallbackTests(unittest.TestCase):
         self.assertEqual(matches, {})
 
 
+class UntrustedManifestPathTests(unittest.TestCase):
+    """Manifest data must never become a filesystem path."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.spines = os.path.join(self.tmp, "a", "b", "spines")
+        os.makedirs(self.spines)
+        ss._config = {"spines_dir": self.spines, "linked_folders": []}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def all_files(self):
+        out = []
+        for root, _, files in os.walk(self.tmp):
+            out += [os.path.join(root, f) for f in files]
+        return out
+
+    def test_li_title_is_not_an_id(self):
+        evil = [{"sid": "s1", "title": "li_../../evil", "author": ""},
+                {"sid": "s2", "title": "li_../../evil2", "author": "Frank Herbert"},
+                {"sid": "s3", "title": "li_abc", "author": "X"}]
+        books = [{"id": "li_abc", "title": "Dune", "author": "Frank Herbert", "asin": "", "isbn": ""}]
+        matches, _ = ss.match_community_spines(evil, books)
+        self.assertEqual(matches, {})
+        r = ss.import_community_spines(BASE, books=books, http_get=FakeHTTP(manifest=evil),
+                                       log=lambda *_: None)
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["downloaded"], 0)
+        self.assertEqual(self.all_files(), [])
+
+    def test_matched_ids_always_come_from_abs(self):
+        matches, _ = ss.match_community_spines(MANIFEST, BOOKS)
+        self.assertTrue(set(matches) <= {b["id"] for b in BOOKS})
+
+    def test_unsafe_book_id_never_written_outside(self):
+        books = [{"id": "../../evil", "title": "Dune", "author": "Frank Herbert",
+                  "asin": "BEVIL", "isbn": ""}]
+        manifest = [{"sid": "s1", "title": "Dune", "author": "Frank Herbert", "asin": "BEVIL"}]
+        r = ss.import_community_spines(BASE, books=books, http_get=FakeHTTP(manifest=manifest),
+                                       log=lambda *_: None)
+        self.assertEqual(r["downloaded"], 0)
+        community = os.path.realpath(ss.get_community_dir())
+        for f in self.all_files():
+            self.assertTrue(os.path.realpath(f).startswith(community + os.sep), f)
+
+    def test_sid_is_url_quoted(self):
+        books = [{"id": "uuid-1", "title": "Dune", "author": "Frank Herbert",
+                  "asin": "BDUNE", "isbn": ""}]
+        manifest = [{"sid": "../../admin?x=1", "title": "Dune", "author": "Frank Herbert",
+                     "asin": "BDUNE"}]
+        http = FakeHTTP(manifest=manifest)
+        ss.import_community_spines(BASE, books=books, http_get=http, log=lambda *_: None)
+        spine_calls = [u for u in http.calls if "/api/spine/" in u]
+        self.assertEqual(spine_calls, [BASE + "/api/spine/..%2F..%2Fadmin%3Fx%3D1"])
+
+
 if __name__ == "__main__":
     unittest.main()

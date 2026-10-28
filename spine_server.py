@@ -580,6 +580,21 @@ def match_community_spines(entries, books):
     return matches, unmatched
 
 
+SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$")
+
+
+def safe_dest_path(directory, book_id, ext):
+    """<directory>/<book_id><ext>, or None if the id isn't a plain ABS item id
+    or the result would land outside <directory>."""
+    if not isinstance(book_id, str) or not SAFE_ID_RE.match(book_id):
+        return None
+    base = os.path.realpath(directory)
+    dest = os.path.realpath(os.path.join(base, book_id + ext))
+    if os.path.dirname(dest) != base:
+        return None
+    return dest
+
+
 def _http_get(url, timeout=30):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -660,12 +675,16 @@ def import_community_spines(community_url=DEFAULT_COMMUNITY_URL, dry_run=False,
             summary["skipped_existing"] += 1
             continue
         book = _books_by_id.get(bid, {})
+        if safe_dest_path(community_dir, bid, ".webp") is None:
+            summary["failed"] += 1
+            log(f"  SKIPPED unsafe ABS item id: {bid!r}")
+            continue
         if dry_run:
             summary["would_download"] += 1
             log(f"  [dry-run] {book.get('title', bid)} <- {entry.get('title')} ({mtype})")
             continue
         try:
-            data, ctype = http_get(f"{base}/api/spine/{urllib.parse.quote(entry['sid'])}")
+            data, ctype = http_get(f"{base}/api/spine/{urllib.parse.quote(str(entry['sid']), safe='')}")
         except Exception as e:
             summary["failed"] += 1
             log(f"  FAILED {book.get('title', bid)}: {e}")
@@ -673,7 +692,10 @@ def import_community_spines(community_url=DEFAULT_COMMUNITY_URL, dry_run=False,
         ext = mimetypes.guess_extension((ctype or "").split(";")[0].strip()) or ".webp"
         if ext not in IMAGE_EXTS:
             ext = ".webp"
-        dest = os.path.join(community_dir, bid + ext)
+        dest = safe_dest_path(community_dir, bid, ext)
+        if dest is None:
+            summary["failed"] += 1
+            continue
         if os.path.exists(dest):  # never overwrite
             summary["skipped_existing"] += 1
             continue
