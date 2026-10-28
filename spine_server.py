@@ -52,14 +52,35 @@ except ImportError:
 # =============================================================================
 
 _script_dir = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(_script_dir, "config.json")
-LEGACY_CONFIG_FILE = CONFIG_FILE
+LEGACY_DEFAULT_CONFIG_FILE = os.path.join(_script_dir, "config.json")
+
+
+def resolve_config_file(env=None):
+    """config.json location: $CONFIG_FILE (Docker: /data/config.json, on a
+    volume) or next to this script."""
+    env = os.environ if env is None else env
+    return env.get("CONFIG_FILE") or LEGACY_DEFAULT_CONFIG_FILE
+
+
+CONFIG_FILE = resolve_config_file()
+# Read (never written) when CONFIG_FILE doesn't exist yet, so configs saved by
+# older versions (e.g. /app/config.json inside the container) carry over.
+LEGACY_CONFIG_FILE = LEGACY_DEFAULT_CONFIG_FILE
 DEFAULT_SPINES_DIR = os.path.join(_script_dir, "spines")
 DEFAULT_PORT = 8786
 
 
 def load_config():
-    """Load config from config.json, with env var overrides."""
+    """Load config.
+
+    Precedence:
+      * abs_url / abs_api_key (editable in the web UI): config.json wins;
+        ABS_URL / ABS_API_KEY env vars are only defaults used when the
+        config has no value. So UI changes survive a container restart.
+      * port / spines_dir / library_path (deployment settings): env vars
+        PORT / SPINES_DIR / LIBRARY_PATH override config.json.
+      * DASHBOARD_TOKEN env overrides "dashboard_token" (see get_dashboard_token).
+    """
     config = {
         "abs_url": "",
         "abs_api_key": "",
@@ -68,16 +89,25 @@ def load_config():
         "linked_folders": [],
     }
 
+    path = None
     if os.path.exists(CONFIG_FILE):
+        path = CONFIG_FILE
+    elif LEGACY_CONFIG_FILE != CONFIG_FILE and os.path.exists(LEGACY_CONFIG_FILE):
+        path = LEGACY_CONFIG_FILE
+    if path:
         try:
-            with open(CONFIG_FILE) as f:
-                config.update(json.load(f))
-        except (json.JSONDecodeError, IOError):
-            pass
+            with open(path) as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                config.update(data)
+            else:
+                print(f"WARNING: ignoring {path}: not a JSON object")
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"WARNING: could not read {path}: {e}")
 
-    if os.environ.get("ABS_URL"):
+    if not config.get("abs_url") and os.environ.get("ABS_URL"):
         config["abs_url"] = os.environ["ABS_URL"]
-    if os.environ.get("ABS_API_KEY"):
+    if not config.get("abs_api_key") and os.environ.get("ABS_API_KEY"):
         config["abs_api_key"] = os.environ["ABS_API_KEY"]
     if os.environ.get("PORT"):
         config["port"] = int(os.environ["PORT"])
@@ -99,10 +129,17 @@ def save_config(config):
     }
     if config.get("dashboard_token"):
         saveable["dashboard_token"] = config["dashboard_token"]
+    parent = os.path.dirname(CONFIG_FILE)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     # 0600: the file holds the ABS API key.
     fd = os.open(CONFIG_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump(saveable, f, indent=2)
+    try:
+        os.chmod(CONFIG_FILE, 0o600)  # also tighten files created by older versions
+    except OSError:
+        pass
 
 
 def get_local_ip():

@@ -1,0 +1,8 @@
+config.json
+data/
+spines/
+.git/
+.env
+__pycache__/
+docker-extension/
+tests/
