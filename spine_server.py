@@ -30,6 +30,8 @@ import unicodedata
 import argparse
 import mimetypes
 import hashlib
+import hmac
+import ipaddress
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -51,6 +53,7 @@ except ImportError:
 
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(_script_dir, "config.json")
+LEGACY_CONFIG_FILE = CONFIG_FILE
 DEFAULT_SPINES_DIR = os.path.join(_script_dir, "spines")
 DEFAULT_PORT = 8786
 
@@ -94,7 +97,11 @@ def save_config(config):
         "port": config.get("port", DEFAULT_PORT),
         "linked_folders": config.get("linked_folders", []),
     }
-    with open(CONFIG_FILE, "w") as f:
+    if config.get("dashboard_token"):
+        saveable["dashboard_token"] = config["dashboard_token"]
+    # 0600: the file holds the ABS API key.
+    fd = os.open(CONFIG_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         json.dump(saveable, f, indent=2)
 
 
@@ -945,6 +952,7 @@ let S={};
 async function api(path,body){
   const opts=body?{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}:{};
   const r=await fetch(path,opts);
+  if(r.status===401){location.href='/login';return {ok:false,message:'Login required.'}}
   return r.json();
 }
 
@@ -1018,7 +1026,7 @@ function render(){
 
   // Settings
   document.getElementById('d-url').value=S.abs_url||'';
-  document.getElementById('d-key').placeholder=S.abs_api_key_masked||'';
+  document.getElementById('d-key').placeholder=S.abs_api_key_set?'Saved (leave blank to keep; required if you change the URL)':'Paste your API key';
 }
 
 function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
@@ -1031,7 +1039,9 @@ async function doTest(){
 }
 
 async function doSave(){
-  await api('/api/ui/action',{action:'save_config',abs_url:document.getElementById('s-url').value,abs_api_key:document.getElementById('s-key').value});
+  const el=document.getElementById('s-result');
+  const r=await api('/api/ui/action',{action:'save_config',abs_url:document.getElementById('s-url').value,abs_api_key:document.getElementById('s-key').value});
+  if(!r.ok){el.className='result err';el.classList.remove('hide');el.textContent=r.message;return}
   await load();
 }
 
@@ -1049,8 +1059,10 @@ async function doSaveDash(){
   const key=document.getElementById('d-key').value;
   const body={action:'save_config',abs_url:url};
   if(key)body.abs_api_key=key;
-  await api('/api/ui/action',body);
-  document.getElementById('d-result').classList.add('hide');
+  const r=await api('/api/ui/action',body);
+  const el=document.getElementById('d-result');
+  if(!r.ok){el.className='result err';el.classList.remove('hide');el.textContent=r.message;return}
+  el.classList.add('hide');
   await load();
 }
 
@@ -1120,6 +1132,168 @@ setInterval(load,5000);
 
 
 # =============================================================================
+# DASHBOARD ACCESS CONTROL
+# =============================================================================
+#
+# Two kinds of endpoints:
+#   * Public, read-only spine endpoints (manifest, spine images, /health) that
+#     the ABS apps fetch from phones/browsers. No auth; manifest + images send
+#     permissive CORS so web clients can use them.
+#   * The dashboard ("/" and /api/ui/*), which can change the ABS URL — and the
+#     server sends the ABS API key to that URL. It is locked down:
+#       - DASHBOARD_TOKEN set  -> login required (HttpOnly SameSite=Strict
+#                                 cookie or "Authorization: Bearer <token>").
+#       - no token             -> loopback clients only, via a loopback Host
+#                                 name (blocks LAN hosts and DNS rebinding).
+#       - POSTs must be application/json and same-origin (blocks cross-site
+#         form/fetch requests from other web pages).
+
+SESSION_COOKIE = "spine_session"
+SESSION_MAX_AGE = 30 * 24 * 3600
+MAX_POST_BYTES = 64 * 1024
+
+REMOTE_LOCKED_MSG = (
+    "The dashboard is only available from this computer (http://localhost:PORT). "
+    "To manage it from another device or from Docker, set the DASHBOARD_TOKEN "
+    "environment variable (or \"dashboard_token\" in config.json) and restart.")
+
+# Directories that are never valid spine folders.
+SYSTEM_DIRS = [
+    "/", "/bin", "/boot", "/dev", "/etc", "/lib", "/lib32", "/lib64", "/proc",
+    "/root", "/run", "/sbin", "/sys", "/usr", "/var/lib", "/var/log", "/var/run",
+    "/System", "/Library", "/private/etc", "/private/var/db", "/private/var/log",
+    "/private/var/root",
+]
+WINDOWS_SYSTEM_DIRS = ["c:\\windows", "c:\\program files", "c:\\program files (x86)"]
+
+
+def get_dashboard_token():
+    return os.environ.get("DASHBOARD_TOKEN") or _config.get("dashboard_token") or ""
+
+
+def session_value(token):
+    """Cookie value derived from the token (the raw token is never stored)."""
+    return hashlib.sha256(("abs-spine-server-session:" + token).encode("utf-8")).hexdigest()
+
+
+def is_public_path(path):
+    return (path in ("/api/spines/manifest", "/health")
+            or (path.startswith("/api/items/") and path.endswith("/spine")))
+
+
+def is_cors_path(path):
+    return path != "/health" and is_public_path(path)
+
+
+def is_loopback_ip(ip):
+    try:
+        addr = ipaddress.ip_address((ip or "").strip("[]").split("%")[0])
+    except ValueError:
+        return False
+    if addr.version == 6 and addr.ipv4_mapped:
+        addr = addr.ipv4_mapped
+    return addr.is_loopback
+
+
+def _split_host(host):
+    """'Host' header / netloc -> (hostname, port or None), lowercased."""
+    host = (host or "").strip().lower()
+    if host.startswith("["):
+        name, _, rest = host[1:].partition("]")
+        port = rest[1:] if rest.startswith(":") else None
+    elif host.count(":") == 1:
+        name, port = host.split(":")
+    else:
+        name, port = host, None
+    return name, (port or None)
+
+
+def host_is_loopback(host_header):
+    name, _ = _split_host(host_header)
+    return name == "localhost" or is_loopback_ip(name)
+
+
+def origin_matches_host(origin, host_header):
+    """True if an Origin header is the same origin as this server's Host."""
+    try:
+        u = urllib.parse.urlsplit(origin or "")
+    except ValueError:
+        return False
+    if u.scheme not in ("http", "https") or not u.hostname:
+        return False
+    default = "443" if u.scheme == "https" else "80"
+    o_port = str(u.port) if u.port else default
+    h_name, h_port = _split_host(host_header)
+    return u.hostname.lower() == h_name and o_port == (h_port or default)
+
+
+def same_abs_url(a, b):
+    return (a or "").strip().rstrip("/").lower() == (b or "").strip().rstrip("/").lower()
+
+
+def validate_abs_url(url):
+    u = urllib.parse.urlsplit(url)
+    return u.scheme in ("http", "https") and bool(u.netloc)
+
+
+def validate_spine_folder(path):
+    """Return (ok, normalized_path_or_error_message)."""
+    path = (path or "").strip()
+    if not path:
+        return False, "No path provided."
+    path = os.path.expanduser(path)
+    if not os.path.isabs(path):
+        return False, "Use a full (absolute) folder path."
+    if not os.path.isdir(path):
+        return False, f"Folder not found: {path}"
+    real = os.path.realpath(path)
+    if platform.system() == "Windows" or re.match(r"^[A-Za-z]:\\", real):
+        low = real.lower().rstrip("\\")
+        if len(low) <= 3 or any(low == d or low.startswith(d + "\\") for d in WINDOWS_SYSTEM_DIRS):
+            return False, f"Refusing to link a system folder: {path}"
+    else:
+        for d in SYSTEM_DIRS:
+            if real == d or (d != "/" and real.startswith(d + "/")):
+                return False, f"Refusing to link a system folder: {path}"
+    if real == os.path.realpath(os.path.expanduser("~")):
+        return False, "Pick the folder that holds your spine images, not your whole home folder."
+    return True, os.path.abspath(path)
+
+
+def get_login_html(error=""):
+    err = f'<p class="err">{error}</p>' if error else ""
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>ABS Spine Server — Sign in</title>
+<style>
+body{{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:#09090b;color:#fafafa;display:flex;justify-content:center;padding-top:15vh}}
+form{{background:#18181b;border:1px solid #27272a;border-radius:12px;padding:24px;width:320px}}
+h1{{font-size:16px;margin:0 0 16px}}
+input{{width:100%;box-sizing:border-box;padding:10px;background:#09090b;border:1px solid #27272a;border-radius:8px;color:#fafafa;font-size:14px}}
+button{{margin-top:12px;width:100%;padding:10px;border:none;border-radius:8px;background:#F3B60C;font-weight:600;cursor:pointer}}
+.err{{color:#ef4444;font-size:13px}}
+</style></head><body>
+<form method="POST" action="/login">
+<h1>ABS Spine Server</h1>
+{err}
+<label for="t" style="font-size:13px">Dashboard token</label>
+<input id="t" name="token" type="password" autofocus autocomplete="current-password">
+<button type="submit">Sign in</button>
+</form></body></html>"""
+
+
+def get_message_html(title, message):
+    import html as _html
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>{_html.escape(title)}</title></head>
+<body style="font-family:system-ui,sans-serif;background:#09090b;color:#fafafa;padding:15vh 24px;max-width:560px;margin:0 auto">
+<h1 style="font-size:18px">{_html.escape(title)}</h1>
+<p style="color:#a1a1aa;line-height:1.5">{_html.escape(message)}</p>
+</body></html>"""
+
+
+# =============================================================================
 # HTTP SERVER
 # =============================================================================
 
@@ -1140,23 +1314,95 @@ class SpineHandler(BaseHTTPRequestHandler):
             cls._manifest = build_manifest(spines)
             cls._last_scan = now
 
+    # ---- access control -------------------------------------------------
+
+    def client_ip(self):
+        return self.client_address[0]
+
+    def _has_valid_session(self, token):
+        auth = self.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            if hmac.compare_digest(auth[7:].strip().encode("utf-8"), token.encode("utf-8")):
+                return True
+        raw = self.headers.get("Cookie", "")
+        if raw:
+            from http.cookies import SimpleCookie, CookieError
+            try:
+                c = SimpleCookie()
+                c.load(raw)
+            except CookieError:
+                return False
+            m = c.get(SESSION_COOKIE)
+            if m and hmac.compare_digest(m.value.encode("utf-8"),
+                                         session_value(token).encode("utf-8")):
+                return True
+        return False
+
+    def ui_access_error(self):
+        """None if this request may use the dashboard, else (status, message)."""
+        token = get_dashboard_token()
+        if token:
+            if self._has_valid_session(token):
+                return None
+            return 401, "Login required."
+        if not is_loopback_ip(self.client_ip()):
+            return 403, REMOTE_LOCKED_MSG
+        if not host_is_loopback(self.headers.get("Host")):
+            return 403, ("Open the dashboard via http://localhost:PORT (or 127.0.0.1). "
+                         + REMOTE_LOCKED_MSG.split(". ", 1)[1])
+        return None
+
+    def cross_site_error(self):
+        """Reject POSTs that come from another web origin."""
+        origin = self.headers.get("Origin")
+        if origin is not None and not origin_matches_host(origin, self.headers.get("Host")):
+            return "Cross-origin request blocked."
+        site = self.headers.get("Sec-Fetch-Site")
+        if site and site not in ("same-origin", "none"):
+            return "Cross-site request blocked."
+        return None
+
+    def read_body(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0) or 0)
+        except ValueError:
+            length = -1
+        if length < 0 or length > MAX_POST_BYTES:
+            return None
+        return self.rfile.read(length) if length else b""
+
+    # ---- routing --------------------------------------------------------
+
     def do_GET(self):
         self.refresh_if_needed()
         path = self.path.split("?")[0]
 
+        if path == "/login":
+            if not get_dashboard_token():
+                self.redirect("/")
+            else:
+                self.send_html(get_login_html())
+            return
+
+        if path == "/logout":
+            self.redirect("/login", cookie=f"{SESSION_COOKIE}=; Max-Age=0; Path=/; "
+                                            "HttpOnly; SameSite=Strict")
+            return
+
         # Web UI
         if path == "/":
-            html = get_ui_html().encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(html)))
-            self.end_headers()
-            self.wfile.write(html)
+            err = self.ui_access_error()
+            if err and err[0] == 401:
+                self.redirect("/login")
+            elif err:
+                self.send_html(get_message_html("Dashboard locked", err[1]), status=err[0])
+            else:
+                self.send_html(get_ui_html())
             return
 
         # Manifest
         if path == "/api/spines/manifest":
-            self.send_json(self._manifest or {"items": [], "version": 1, "count": 0})
+            self.send_json(self._manifest or {"items": [], "version": 1, "count": 0}, cors=True)
             return
 
         # Spine image
@@ -1178,6 +1424,10 @@ class SpineHandler(BaseHTTPRequestHandler):
 
         # UI status API
         if path == "/api/ui/status":
+            err = self.ui_access_error()
+            if err:
+                self.send_json({"ok": False, "message": err[1]}, status=err[0])
+                return
             self.send_json(self.build_ui_status())
             return
 
@@ -1186,96 +1436,136 @@ class SpineHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         path = self.path.split("?")[0]
 
-        if path == "/api/ui/action":
-            try:
-                length = int(self.headers.get("Content-Length", 0))
-                body = json.loads(self.rfile.read(length)) if length else {}
-            except (json.JSONDecodeError, ValueError):
-                self.send_json({"ok": False, "message": "Invalid JSON"})
+        if path == "/login":
+            token = get_dashboard_token()
+            if not token:
+                self.send_error(404)
                 return
-
-            action = body.get("action", "")
-
-            if action == "test_connection":
-                result = test_connection(
-                    body.get("abs_url", ""),
-                    body.get("abs_api_key", ""),
-                )
-                self.send_json(result)
-
-            elif action == "save_config":
-                if body.get("abs_url"):
-                    _config["abs_url"] = body["abs_url"]
-                if body.get("abs_api_key"):
-                    _config["abs_api_key"] = body["abs_api_key"]
-                save_config(_config)
-                # Re-index in background
-                threading.Thread(target=reload_index, daemon=True).start()
-                self.send_json({"ok": True})
-
-            elif action == "add_folder":
-                folder = body.get("path", "").strip()
-                if not folder:
-                    self.send_json({"ok": False, "message": "No path provided."})
-                elif not os.path.isdir(folder):
-                    self.send_json({"ok": False, "message": f"Folder not found: {folder}"})
-                else:
-                    folders = _config.get("linked_folders", [])
-                    if folder not in folders:
-                        folders.append(folder)
-                        _config["linked_folders"] = folders
-                        save_config(_config)
-                        SpineHandler._last_scan = 0  # force rescan
-                    self.send_json({"ok": True})
-
-            elif action == "remove_folder":
-                folder = body.get("path", "")
-                folders = _config.get("linked_folders", [])
-                if folder in folders:
-                    folders.remove(folder)
-                    _config["linked_folders"] = folders
-                    save_config(_config)
-                    SpineHandler._last_scan = 0
-                self.send_json({"ok": True})
-
-            elif action == "browse_folder":
-                folder = pick_folder()
-                if folder:
-                    if os.path.isdir(folder):
-                        folders = _config.get("linked_folders", [])
-                        if folder not in folders:
-                            folders.append(folder)
-                            _config["linked_folders"] = folders
-                            save_config(_config)
-                            SpineHandler._last_scan = 0
-                        self.send_json({"ok": True, "path": folder})
-                    else:
-                        self.send_json({"ok": False, "message": f"Not a valid folder: {folder}"})
-                else:
-                    self.send_json({"ok": False, "cancelled": True, "message": "No folder selected."})
-
-            elif action == "import_community":
-                if _import_state["running"]:
-                    self.send_json({"ok": False, "message": "Import already running."})
-                else:
-                    threading.Thread(target=_run_ui_import, daemon=True).start()
-                    self.send_json({"ok": True, "message": "Import started."})
-
-            elif action == "rescan":
-                threading.Thread(target=reload_index, daemon=True).start()
-                self.send_json({"ok": True})
-
+            if self.cross_site_error():
+                self.send_html(get_login_html("Cross-site sign-in blocked."), status=403)
+                return
+            raw = self.read_body()
+            given = ""
+            if raw is not None:
+                form = urllib.parse.parse_qs(raw.decode("utf-8", "replace"))
+                given = (form.get("token") or [""])[0]
+            if given and hmac.compare_digest(given.encode("utf-8"), token.encode("utf-8")):
+                self.redirect("/", cookie=(f"{SESSION_COOKIE}={session_value(token)}; "
+                                           f"Max-Age={SESSION_MAX_AGE}; Path=/; "
+                                           "HttpOnly; SameSite=Strict"))
             else:
-                self.send_json({"ok": False, "message": f"Unknown action: {action}"})
+                time.sleep(1)  # slow down guessing
+                self.send_html(get_login_html("Wrong token."), status=401)
+            return
+
+        if path.startswith("/api/ui/"):
+            err = self.ui_access_error()
+            if err:
+                self.send_json({"ok": False, "message": err[1]}, status=err[0])
+                return
+            xs = self.cross_site_error()
+            if xs:
+                self.send_json({"ok": False, "message": xs}, status=403)
+                return
+            ctype = self.headers.get("Content-Type", "").split(";")[0].strip().lower()
+            if ctype != "application/json":
+                self.send_json({"ok": False, "message": "Content-Type must be application/json"},
+                               status=415)
+                return
+            if path != "/api/ui/action":
+                self.send_error(404)
+                return
+            raw = self.read_body()
+            if raw is None:
+                self.send_json({"ok": False, "message": "Request too large"}, status=413)
+                return
+            try:
+                body = json.loads(raw) if raw else {}
+            except (json.JSONDecodeError, ValueError):
+                body = None
+            if not isinstance(body, dict):
+                self.send_json({"ok": False, "message": "Invalid JSON"}, status=400)
+                return
+            self.send_json(self.handle_action(body))
             return
 
         self.send_error(404)
 
+    def handle_action(self, body):
+        action = body.get("action", "")
+
+        if action == "test_connection":
+            url = str(body.get("abs_url") or "").strip() or _config.get("abs_url", "")
+            key = str(body.get("abs_api_key") or "").strip()
+            if not key:
+                if not same_abs_url(url, _config.get("abs_url", "")):
+                    return {"ok": False, "message": "Enter the API key to test a different ABS URL."}
+                key = _config.get("abs_api_key", "")
+            return test_connection(url, key)
+
+        if action == "save_config":
+            new_url = str(body.get("abs_url") or "").strip()
+            new_key = str(body.get("abs_api_key") or "").strip()
+            if new_url and not validate_abs_url(new_url):
+                return {"ok": False, "message": "ABS URL must start with http:// or https://"}
+            if new_url and not same_abs_url(new_url, _config.get("abs_url", "")) and not new_key:
+                # Never send the stored key to a newly supplied URL.
+                return {"ok": False, "message": "Re-enter the API key when changing the ABS URL."}
+            if new_url:
+                _config["abs_url"] = new_url
+            if new_key:
+                _config["abs_api_key"] = new_key
+            save_config(_config)
+            threading.Thread(target=reload_index, daemon=True).start()
+            return {"ok": True}
+
+        if action in ("add_folder", "browse_folder"):
+            if action == "browse_folder":
+                picked = pick_folder()
+                if not picked:
+                    return {"ok": False, "cancelled": True, "message": "No folder selected."}
+            else:
+                picked = str(body.get("path") or "")
+            ok, result = validate_spine_folder(picked)
+            if not ok:
+                return {"ok": False, "message": result}
+            folders = _config.get("linked_folders", [])
+            if result not in folders:
+                folders.append(result)
+                _config["linked_folders"] = folders
+                save_config(_config)
+                SpineHandler._last_scan = 0  # force rescan
+            return {"ok": True, "path": result}
+
+        if action == "remove_folder":
+            folder = body.get("path", "")
+            folders = _config.get("linked_folders", [])
+            if folder in folders:
+                folders.remove(folder)
+                _config["linked_folders"] = folders
+                save_config(_config)
+                SpineHandler._last_scan = 0
+            return {"ok": True}
+
+        if action == "import_community":
+            if _import_state["running"]:
+                return {"ok": False, "message": "Import already running."}
+            threading.Thread(target=_run_ui_import, daemon=True).start()
+            return {"ok": True, "message": "Import started."}
+
+        if action == "rescan":
+            threading.Thread(target=reload_index, daemon=True).start()
+            return {"ok": True}
+
+        return {"ok": False, "message": f"Unknown action: {action}"}
+
     def do_OPTIONS(self):
+        path = self.path.split("?")[0]
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        if is_cors_path(path):
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Content-Length", "0")
         self.end_headers()
 
     def serve_spine(self, book_id):
@@ -1298,14 +1588,36 @@ class SpineHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def send_json(self, data):
+    def send_json(self, data, status=200, cors=False):
         body = json.dumps(data).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        if cors:
+            self.send_header("Access-Control-Allow-Origin", "*")
+        else:
+            self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def send_html(self, html, status=200):
+        data = html.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def redirect(self, location, cookie=None):
+        self.send_response(303)
+        self.send_header("Location", location)
+        if cookie:
+            self.send_header("Set-Cookie", cookie)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def build_ui_status(self):
         spines, unmatched = find_spine_files()
@@ -1337,14 +1649,12 @@ class SpineHandler(BaseHTTPRequestHandler):
                 "author": book.get("author", "") if book else "",
             })
 
-        key = _config.get("abs_api_key", "")
-        masked = ("*" * min(len(key), 20) + key[-4:]) if len(key) > 4 else "*" * len(key)
-
         return {
             "configured": bool(_config.get("abs_url") and _config.get("abs_api_key")),
             "connected": _index_loaded and len(_books_by_id) > 0,
             "abs_url": _config.get("abs_url", ""),
-            "abs_api_key_masked": masked,
+            "abs_api_key_set": bool(_config.get("abs_api_key")),
+            "auth_enabled": bool(get_dashboard_token()),
             "port": _config.get("port", DEFAULT_PORT),
             "local_ip": get_local_ip(),
             "indexed_books": len(_books_by_id),
@@ -1467,6 +1777,16 @@ def cmd_serve(port, open_browser=True):
     if not is_configured:
         print("Open the web UI to complete setup.")
         print()
+
+    if get_dashboard_token():
+        print("Dashboard login: enabled (DASHBOARD_TOKEN).")
+    else:
+        print("NOTE: DASHBOARD_TOKEN is not set, so the dashboard only works from this")
+        print(f"      computer at http://localhost:{port}. Spine images stay public on the")
+        print("      network. To manage the server from another device or from Docker")
+        print("      (where requests come from the bridge network), set DASHBOARD_TOKEN")
+        print("      to a long random string, e.g. DASHBOARD_TOKEN=$(openssl rand -hex 24)")
+    print()
 
     # Open browser
     if open_browser:
