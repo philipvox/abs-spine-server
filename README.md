@@ -47,6 +47,7 @@ The server connects to your ABS instance, learns your books, and auto-matches fi
 <tr><td>
 
 ```bash
+# set DASHBOARD_TOKEN in docker-compose.yml
 docker compose up -d
 ```
 
@@ -70,6 +71,7 @@ See [`docker-extension/README.md`](docker-extension/README.md) for one-click ins
 ## Table of Contents
 
 - [Web UI](#web-ui)
+- [Security](#security)
 - [How It Works](#how-it-works)
 - [Getting an API Key](#getting-an-api-key)
 - [File Naming](#file-naming)
@@ -100,6 +102,31 @@ The server includes a built-in web dashboard at `http://localhost:8786`. No extr
 - **Settings** — update ABS connection at any time
 
 The dashboard auto-refreshes every 5 seconds. Drop new images into any linked folder and watch them appear.
+
+> **Remote access / Docker:** by default the dashboard only works from the computer the server runs on (`http://localhost:8786`). To use it from another device — or at all when running in Docker — set `DASHBOARD_TOKEN`. See [Security](#security).
+
+---
+
+## Security
+
+The server has two kinds of endpoints:
+
+| | Endpoints | Access |
+|---|---|---|
+| **Public, read-only** | `/api/spines/manifest`, `/api/items/{id}/spine`, `/health` | Open to anyone who can reach the port (your phone needs them). The manifest and images send `Access-Control-Allow-Origin: *`. |
+| **Dashboard** | `/`, `/api/ui/*` | Locked down — it can change which ABS server the API key is sent to. No CORS. |
+
+How the dashboard is protected:
+
+- **`DASHBOARD_TOKEN` not set (default):** the dashboard only answers requests from this computer (`127.0.0.1` / `::1`) addressed to `localhost` or `127.0.0.1`. Other devices on your network get a "Dashboard locked" page. The server prints a note about this on startup.
+- **`DASHBOARD_TOKEN` set:** the dashboard works from anywhere that can reach the port, after signing in with the token at `/login` (sets an `HttpOnly`, `SameSite=Strict` cookie; scripts can send `Authorization: Bearer <token>`). Use a long random value, e.g. `openssl rand -hex 24`. It can also be set as `"dashboard_token"` in `config.json`; the env var wins. The cookie is only as private as the connection — over plain HTTP use it on a network you trust, or put the server behind HTTPS.
+- **Always:** dashboard actions must be `application/json` POSTs from the same origin, so other websites you visit can't drive the dashboard in the background.
+- The API key is never sent back to the browser (not even a masked suffix).
+- Changing the ABS URL requires re-entering the API key in the same request, so the stored key is never sent to a newly entered address. **Test** with an empty key field tests the saved URL with the saved key.
+- Linked folders must be existing absolute directories; system folders (`/etc`, `/usr`, `/System`, `C:\Windows`, …) and your whole home folder are refused.
+- `config.json` is written with mode `600`.
+
+**Docker:** requests reach the container from the Docker bridge network, not from localhost, so the dashboard is **locked unless you set `DASHBOARD_TOKEN`**. Alternatively, skip the dashboard and configure everything with environment variables.
 
 ---
 
@@ -135,11 +162,13 @@ The dashboard auto-refreshes every 5 seconds. Drop new images into any linked fo
 
 ## Getting an API Key
 
-The server needs to read your book list from ABS. It uses an API key — a read-only token that never modifies anything.
+The server needs to read your book list from ABS, which it does with an ABS API key. The spine server itself only ever makes `GET` requests to ABS — but **an ABS API key carries all the permissions of the user it belongs to**. A key created for an admin account is an admin key, and anyone who obtains it can do whatever that admin can.
 
-1. Open ABS in your browser
-2. **Settings** (gear icon) → **Users** → click your username
-3. Scroll to **API Tokens** → click **Create**
+**Recommended:** create a dedicated, low-privilege ABS user for the spine server:
+
+1. In ABS: **Settings** → **Users** → **Add User**, e.g. `spine-server`, account type **User** (not Admin)
+2. Give it access to the libraries you want spines for, and untick download/update/delete/upload permissions — it only needs to read the library
+3. Log in as (or edit) that user → **API Tokens** → **Create**
 4. Copy the token
 
 You can enter it in the web UI setup page, or pass it via the `ABS_API_KEY` environment variable.
@@ -213,18 +242,28 @@ Instead of copying images into `spines/`, you can point the server at any folder
 }
 ```
 
-You can link as many folders as you want. The server scans all of them plus the default `spines/` folder. If the same book is matched in multiple folders, the first match wins (default folder has priority).
+You can link as many folders as you want. The server scans the default `spines/` folder first, then linked folders in the order you added them, then `spines/community/`. When more than one file matches the same book:
+
+- a file **named by book ID** (`li_abc123.png` / the ABS item UUID) always wins over a title-matched file, whichever folder it is in;
+- otherwise the **first folder scanned** wins — so the default `spines/` folder has priority over linked folders;
+- files in `spines/community/` (from the community import) never replace a spine from any other folder.
+
+Linked folders must be existing absolute paths; system folders and your whole home folder are refused.
 
 ---
 
 ## Configuration
 
-Configuration is loaded in this priority order (higher overrides lower):
+Where each setting comes from (highest priority first):
 
-1. **CLI arguments** (`--port`, `--spines-dir`)
-2. **Environment variables** (`ABS_URL`, `ABS_API_KEY`, etc.)
-3. **config.json** (created by the web UI, or by hand)
-4. **Defaults**
+| Setting | Priority |
+|---|---|
+| ABS URL, API key (editable in the web UI) | **config.json** → `ABS_URL` / `ABS_API_KEY` env vars → empty |
+| Port, spines folder | CLI (`--port`, `--spines-dir`) → env (`PORT`, `SPINES_DIR`) → config.json → defaults |
+| Library path | `LIBRARY_PATH` env → config.json |
+| Dashboard token | `DASHBOARD_TOKEN` env → `dashboard_token` in config.json |
+
+In other words, `ABS_URL` / `ABS_API_KEY` are **defaults**: once you save a URL or key in the web UI it is stored in `config.json` and wins over the env vars on every restart. To go back to the env values, delete those fields from `config.json`.
 
 ### Environment variables
 
@@ -235,6 +274,8 @@ Configuration is loaded in this priority order (higher overrides lower):
 | `SPINES_DIR` | `./spines` | Default folder for spine images |
 | `LIBRARY_PATH` | *(empty)* | Path to audiobook files (only for `--scan-library`) |
 | `PORT` | `8786` | HTTP port |
+| `DASHBOARD_TOKEN` | *(empty)* | Password for the web UI. Required to use the dashboard from another device or in Docker ([Security](#security)) |
+| `CONFIG_FILE` | `./config.json` (Docker: `/data/config.json`) | Where settings saved from the web UI are stored |
 
 ### CLI
 
@@ -254,18 +295,19 @@ python3 spine_server.py [OPTIONS]
 
 ### config.json
 
-Created automatically by the web UI when you save settings. You can also create it by hand:
+Created automatically by the web UI when you save settings (next to `spine_server.py`, or at `$CONFIG_FILE` — `/data/config.json` in Docker). You can also create it by hand:
 
 ```json
 {
   "abs_url": "http://192.168.1.50:13378",
   "abs_api_key": "your-key-here",
   "port": 8786,
-  "linked_folders": []
+  "linked_folders": [],
+  "dashboard_token": "optional-long-random-string"
 }
 ```
 
-> **Note:** `config.json` is gitignored since it contains your API key.
+> **Note:** `config.json` contains your API key. It is gitignored and written with mode `600`.
 
 ### Importing existing spines
 
@@ -296,7 +338,12 @@ Or click **Import curated community spines** in the web UI.
   uploads are not included. If the server only offers the older v2 manifest, the
   import stops and downloads nothing.
 - Matches your ABS books by **ASIN**, then **ISBN**, then a normalized
-  title+author hash, then the same fuzzy title matching used for file names.
+  title+author hash, then a strict title fallback: the normalized title must
+  be identical **and** the author's last name must match (no partial/contained
+  titles, so "Silence" is never matched to "Silence in Hanover Close").
+- The remote manifest is treated as untrusted: malformed entries are skipped
+  (and counted in the summary), downloads are capped at 10 MB and must be real
+  PNG/JPEG/WebP images, and files are only ever named after ABS item ids.
 - Downloads only for books that have **no spine yet** (in any folder) into
   `spines/community/<ABS item id>.webp`. Existing files are never overwritten, and
   a spine you add yourself later always takes precedence over an imported one.
@@ -319,11 +366,16 @@ services:
     ports:
       - "8786:8786"
     volumes:
-      - ./spines:/spines
+      - ./spines:/spines   # spine images
+      - ./data:/data       # config.json saved by the web UI — keep this!
     environment:
-      ABS_URL: http://audiobookshelf:13378
-      ABS_API_KEY: your-key-here
+      DASHBOARD_TOKEN: change-me-to-a-long-random-string   # needed for the web UI
+      ABS_URL: http://audiobookshelf:13378                 # default, UI can override
+      ABS_API_KEY: your-key-here                           # optional, or enter in the UI
 ```
+
+- **`/data` volume:** settings saved in the web UI go to `/data/config.json`. Without the volume they are lost whenever the container is recreated (e.g. on image updates). If you are upgrading from a version that stored settings in `/app/config.json`, that file is still read until the first save — but it only survives if the container was never recreated, so re-enter your settings once after adding the volume.
+- **`DASHBOARD_TOKEN`:** inside Docker the dashboard sees requests from the bridge network, not localhost, so it stays locked without a token. Open `http://YOUR_IP:8786`, sign in with the token, and finish setup. If you configure everything via env vars you can leave it unset — spine serving works either way.
 
 ### Same network as ABS
 
@@ -338,7 +390,9 @@ services:
       - "8786:8786"
     volumes:
       - ./spines:/spines
+      - ./data:/data
     environment:
+      DASHBOARD_TOKEN: change-me-to-a-long-random-string
       ABS_URL: http://audiobookshelf:13378
       ABS_API_KEY: your-key-here
     networks:
@@ -353,12 +407,13 @@ Find your ABS network name with `docker network ls`.
 
 ### With .env file
 
-Keep your API key out of version control:
+Keep your API key and token out of version control:
 
 ```bash
 # .env (add to .gitignore)
 ABS_URL=http://audiobookshelf:13378
 ABS_API_KEY=your-key-here
+DASHBOARD_TOKEN=change-me-to-a-long-random-string
 ```
 
 ```yaml
@@ -370,12 +425,13 @@ services:
       - "8786:8786"
     volumes:
       - ./spines:/spines
+      - ./data:/data
     env_file: .env
 ```
 
 ### Health check
 
-The Docker image includes a built-in health check (`/health` endpoint, every 30s). Check status with:
+The Docker image includes a built-in health check (`/health` endpoint on `$PORT`, every 30s). Check status with:
 
 ```bash
 docker inspect --format='{{.State.Health.Status}}' abs-spine-server
@@ -412,7 +468,7 @@ Three public endpoints (no authentication required), plus the web UI.
 
 ### `GET /`
 
-The web UI dashboard. Setup wizard on first visit, management dashboard after.
+The web UI dashboard. Setup wizard on first visit, management dashboard after. Not public: localhost-only, or behind `DASHBOARD_TOKEN` (see [Security](#security)). `/api/ui/*` follows the same rules.
 
 ### `GET /api/spines/manifest`
 
@@ -432,7 +488,7 @@ Returns which books have spine images.
 Returns the spine image for a book. Responds with the image file and appropriate `Content-Type`.
 
 - **Cache:** `Cache-Control: public, max-age=604800` (1 week)
-- **CORS:** `Access-Control-Allow-Origin: *`
+- **CORS:** `Access-Control-Allow-Origin: *` (also on the manifest)
 - **404** if no spine exists for that book
 
 ### `GET /health`
@@ -517,7 +573,7 @@ spine_server.py
 ├─ Startup
 │  ├─ Load config.json (or env vars)
 │  ├─ GET /api/libraries          → list of libraries
-│  ├─ GET /api/libraries/{id}/items → all books per library
+│  ├─ GET /api/libraries/{id}/items → all books per library (500 per page)
 │  ├─ Build title index            → normalized keys → book IDs
 │  └─ Open browser to web UI
 │
@@ -530,8 +586,9 @@ spine_server.py
    ├─ /                        → web UI (setup wizard / dashboard)
    ├─ /api/spines/manifest     → JSON manifest
    ├─ /api/items/{id}/spine    → image file from disk
-   ├─ /api/ui/status           → dashboard data (JSON)
-   ├─ /api/ui/action           → config changes (POST)
+   ├─ /login, /logout          → dashboard sign-in (when DASHBOARD_TOKEN is set)
+   ├─ /api/ui/status           → dashboard data (JSON, protected)
+   ├─ /api/ui/action           → config changes (JSON POST, protected, same-origin)
    └─ /health                  → status JSON
 ```
 
