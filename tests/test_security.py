@@ -32,7 +32,7 @@ class ServerTestBase(unittest.TestCase):
             "CONFIG_FILE": ss.CONFIG_FILE,
             "LEGACY_CONFIG_FILE": ss.LEGACY_CONFIG_FILE,
             "reload_index": ss.reload_index,
-            "abs_api_get": ss.abs_api_get,
+            "abs_api_request": ss.abs_api_request,
             "test_connection": ss.test_connection,
         }
         ss.CONFIG_FILE = os.path.join(self.tmp, "config.json")
@@ -42,8 +42,8 @@ class ServerTestBase(unittest.TestCase):
 
         def fake_get(endpoint, abs_url=None, api_key=None, **kw):
             self.abs_calls.append((endpoint, abs_url, api_key))
-            return None
-        ss.abs_api_get = fake_get
+            raise ss.ABSError("fake ABS: not reachable in tests")
+        ss.abs_api_request = fake_get
         ss._config = {
             "abs_url": "http://abs.local:13378",
             "abs_api_key": SECRET_KEY,

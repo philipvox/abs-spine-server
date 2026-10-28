@@ -214,54 +214,95 @@ _import_lock = threading.Lock()  # held for the whole duration of an import
 # ABS API HELPERS
 # =============================================================================
 
-def abs_api_get(endpoint, abs_url=None, api_key=None):
-    """Make a GET request to the ABS API. Returns parsed JSON or None."""
+ABS_PAGE_SIZE = 500
+ABS_TIMEOUT = 60
+
+
+class ABSError(Exception):
+    """A request to the ABS API failed (unreachable, HTTP error, bad JSON)."""
+
+
+def abs_api_request(endpoint, abs_url=None, api_key=None, timeout=ABS_TIMEOUT):
+    """GET an ABS API endpoint and return parsed JSON. Raises ABSError."""
     url = abs_url or _config.get("abs_url", "")
     key = api_key or _config.get("abs_api_key", "")
-
     if not key or not url:
-        return None
+        raise ABSError("ABS URL or API key is not configured.")
 
     full_url = f"{url.rstrip('/')}{endpoint}"
     req = urllib.request.Request(full_url)
     req.add_header("Authorization", f"Bearer {key}")
-
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read().decode())
-    except (urllib.error.HTTPError, urllib.error.URLError, Exception):
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        hint = " (check the API key)" if e.code in (401, 403) else ""
+        raise ABSError(f"ABS returned HTTP {e.code} for {endpoint}{hint}.")
+    except urllib.error.URLError as e:
+        raise ABSError(f"Could not reach ABS at {url}: {e.reason}")
+    except (OSError, ValueError) as e:
+        raise ABSError(f"ABS request {endpoint} failed: {e}")
+
+
+def abs_api_get(endpoint, abs_url=None, api_key=None):
+    """Like abs_api_request, but returns None on any failure."""
+    try:
+        return abs_api_request(endpoint, abs_url, api_key)
+    except ABSError:
         return None
 
 
+def _abs_libraries(abs_url=None, api_key=None):
+    data = abs_api_request("/api/libraries", abs_url, api_key)
+    libs = data.get("libraries") if isinstance(data, dict) else None
+    if not isinstance(libs, list):
+        raise ABSError("Unexpected response from ABS /api/libraries.")
+    return [lib for lib in libs if isinstance(lib, dict) and lib.get("id")]
+
+
+def _str_or(value, default):
+    if value is None or value == "":
+        return default
+    return value if isinstance(value, str) else str(value)
+
+
 def get_all_books(abs_url=None, api_key=None):
-    """Get ALL books from ALL libraries."""
+    """Get ALL books from ALL libraries, paging through each library.
+    Raises ABSError if any request fails (so a failure never looks like an
+    empty library)."""
     books = []
-    data = abs_api_get("/api/libraries", abs_url, api_key)
-    if not data:
-        return books
-
-    for lib in data.get("libraries", []):
-        lib_id = lib["id"]
-        lib_name = lib.get("name", lib_id)
-        items_data = abs_api_get(
-            f"/api/libraries/{lib_id}/items?limit=100000", abs_url, api_key
-        )
-        if not items_data:
-            continue
-
-        for item in items_data.get("results", []):
-            meta = item.get("media", {}).get("metadata", {})
-            books.append({
-                "id": item["id"],
-                "title": meta.get("title", "Unknown"),
-                "author": meta.get("authorName", "Unknown"),
-                "path": item.get("path", ""),
-                "asin": meta.get("asin") or "",
-                "isbn": meta.get("isbn") or "",
-                "libraryId": lib_id,
-                "libraryName": lib_name,
-            })
-
+    for lib in _abs_libraries(abs_url, api_key):
+        lib_id = str(lib["id"])
+        lib_name = _str_or(lib.get("name"), lib_id)
+        page, seen = 0, 0
+        while True:
+            data = abs_api_request(
+                f"/api/libraries/{urllib.parse.quote(lib_id, safe='')}/items"
+                f"?limit={ABS_PAGE_SIZE}&page={page}&minified=1", abs_url, api_key)
+            results = data.get("results") if isinstance(data, dict) else None
+            if not isinstance(results, list):
+                raise ABSError(f"Unexpected response listing library {lib_name}.")
+            for item in results:
+                if not isinstance(item, dict) or not item.get("id"):
+                    continue
+                media = item.get("media") if isinstance(item.get("media"), dict) else {}
+                meta = media.get("metadata") if isinstance(media.get("metadata"), dict) else {}
+                books.append({
+                    "id": str(item["id"]),
+                    "title": _str_or(meta.get("title"), "Unknown"),
+                    "author": _str_or(meta.get("authorName"), "Unknown"),
+                    "path": _str_or(item.get("path"), ""),
+                    "asin": _str_or(meta.get("asin"), ""),
+                    "isbn": _str_or(meta.get("isbn"), ""),
+                    "libraryId": lib_id,
+                    "libraryName": lib_name,
+                })
+            seen += len(results)
+            total = data.get("total")
+            if (not results or len(results) < ABS_PAGE_SIZE
+                    or (isinstance(total, int) and seen >= total)):
+                break
+            page += 1
     return books
 
 
@@ -273,20 +314,16 @@ def test_connection(abs_url, api_key):
         return {"ok": False, "message": "No API key provided."}
 
     try:
-        data = abs_api_get("/api/libraries", abs_url, api_key)
-        if data is None:
-            return {"ok": False, "message": "Could not connect. Check the URL and API key."}
-
         total = 0
-        for lib in data.get("libraries", []):
-            items = abs_api_get(
-                f"/api/libraries/{lib['id']}/items?limit=100000", abs_url, api_key
-            )
-            if items:
-                total += len(items.get("results", []))
-
+        for lib in _abs_libraries(abs_url, api_key):
+            lib_id = urllib.parse.quote(str(lib["id"]), safe="")
+            data = abs_api_request(f"/api/libraries/{lib_id}/items?limit=1&page=0&minified=1",
+                                   abs_url, api_key)
+            if isinstance(data, dict):
+                n = data.get("total")
+                total += n if isinstance(n, int) else len(data.get("results") or [])
         return {"ok": True, "message": f"Connected! Found {total} books.", "books_count": total}
-    except Exception as e:
+    except ABSError as e:
         return {"ok": False, "message": str(e)}
 
 
@@ -299,6 +336,10 @@ def normalize(text):
     Normalize a string for fuzzy comparison.
     "The Hitchhiker's Guide" -> "hitchhikers guide"
     """
+    if text is None:
+        return ""
+    if not isinstance(text, str):
+        text = str(text)
     text = unicodedata.normalize("NFKD", text)
     text = text.lower()
     text = re.sub(r"[_.\-]+", " ", text)
@@ -410,12 +451,13 @@ _books_by_id = {}
 _books_list = []
 _index_loaded = False
 _collisions = {}
+_index_error = ""   # last ABS error while building the index ("" = ok)
 _lock = threading.Lock()
 
 
 def load_book_index():
     """Fetch books from ABS and build the matching index."""
-    global _title_index, _books_by_id, _books_list, _index_loaded, _collisions
+    global _title_index, _books_by_id, _books_list, _index_loaded, _collisions, _index_error
 
     api_key = _config.get("abs_api_key", "")
 
@@ -424,7 +466,15 @@ def load_book_index():
         return 0
 
     print("Connecting to ABS to build book index...")
-    books = get_all_books()
+    try:
+        books = get_all_books()
+    except ABSError as e:
+        # Keep whatever index we had; a failure must not look like an empty library.
+        _index_error = str(e)
+        _index_loaded = True
+        print(f"WARNING: Could not load books from ABS: {e}")
+        return 0
+    _index_error = ""
 
     with _lock:
         if books:
@@ -732,7 +782,12 @@ def import_community_spines(community_url=DEFAULT_COMMUNITY_URL, dry_run=False,
                "unmatched": 0, "invalid": 0, "by_type": {}, "message": ""}
 
     if books is None:
-        books = get_all_books()
+        try:
+            books = get_all_books()
+        except ABSError as e:
+            summary["message"] = f"Could not load books from ABS: {e}"
+            log(summary["message"])
+            return summary
     if not books:
         summary["message"] = "No books from ABS — check abs_url / abs_api_key."
         log(summary["message"])
@@ -1113,7 +1168,8 @@ function render(){
     return;
   }
   setup.classList.add('hide');dash.classList.remove('hide');
-  badge.textContent=S.connected?'Connected':'Disconnected';
+  badge.textContent=S.connected?'Connected':(S.index_error?'ABS error':'Disconnected');
+  badge.title=S.index_error||'';
   badge.className='badge '+(S.connected?'badge-ok':'badge-err');
 
   document.getElementById('app-url').textContent='http://'+S.local_ip+':'+S.port;
@@ -1191,7 +1247,7 @@ async function doTestDash(){
   el.className='result load';el.classList.remove('hide');el.textContent='Testing...';
   const url=document.getElementById('d-url').value;
   const key=document.getElementById('d-key').value;
-  const r=await api('/api/ui/action',{action:'test_connection',abs_url:url,abs_api_key:key||S.abs_api_key_raw||''});
+  const r=await api('/api/ui/action',{action:'test_connection',abs_url:url,abs_api_key:key});
   el.className='result '+(r.ok?'ok':'err');el.textContent=r.message;
 }
 
@@ -1791,7 +1847,8 @@ class SpineHandler(BaseHTTPRequestHandler):
 
         return {
             "configured": bool(_config.get("abs_url") and _config.get("abs_api_key")),
-            "connected": _index_loaded and len(_books_by_id) > 0,
+            "connected": _index_loaded and len(_books_by_id) > 0 and not _index_error,
+            "index_error": _index_error,
             "abs_url": _config.get("abs_url", ""),
             "abs_api_key_set": bool(_config.get("abs_api_key")),
             "auth_enabled": bool(get_dashboard_token()),
@@ -1820,10 +1877,18 @@ class SpineHandler(BaseHTTPRequestHandler):
 # CLI COMMANDS
 # =============================================================================
 
+def _cli_books():
+    try:
+        return get_all_books()
+    except ABSError as e:
+        print(f"ERROR: {e}")
+        sys.exit(1)
+
+
 def cmd_list_books():
     """Print all books with their IDs."""
     print("Fetching books from ABS...")
-    books = get_all_books()
+    books = _cli_books()
     if not books:
         print("No books found.")
         return
@@ -1837,7 +1902,7 @@ def cmd_list_books():
 def cmd_scan_library():
     """Scan ABS library folders for existing spine images."""
     print("Fetching books from ABS...")
-    books = get_all_books()
+    books = _cli_books()
     if not books:
         print("No books found.")
         return
@@ -1882,7 +1947,7 @@ def _run_ui_import():
 def cmd_import_community(community_url, dry_run=False):
     """Bulk-import curated community spines into spines/community/."""
     print("Fetching books from ABS...")
-    books = get_all_books()
+    books = _cli_books()
     if not books:
         print("No books found — check abs_url / abs_api_key (config.json or env).")
         sys.exit(1)
