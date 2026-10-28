@@ -595,21 +595,77 @@ def safe_dest_path(directory, book_id, ext):
     return dest
 
 
-def _http_get(url, timeout=30):
+MAX_IMAGE_BYTES = 10 * 1024 * 1024       # per downloaded spine
+MAX_MANIFEST_BYTES = 50 * 1024 * 1024    # community manifest JSON
+
+
+def _http_get(url, timeout=30, max_bytes=MAX_IMAGE_BYTES):
+    """GET url -> (body, content_type). Raises ValueError if the body is
+    larger than max_bytes (checked against Content-Length and while reading)."""
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return resp.read(), resp.headers.get("Content-Type", "")
+        length = resp.headers.get("Content-Length")
+        if length and str(length).isdigit() and int(length) > max_bytes:
+            raise ValueError(f"response too large ({length} bytes, limit {max_bytes})")
+        body = resp.read(max_bytes + 1)
+        if len(body) > max_bytes:
+            raise ValueError(f"response too large (limit {max_bytes} bytes)")
+        return body, resp.headers.get("Content-Type", "")
+
+
+def sniff_image_ext(data):
+    """File extension from the image's magic bytes, or None if it isn't a
+    PNG / JPEG / WebP."""
+    if not data:
+        return None
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    return None
+
+
+def sanitize_manifest(raw):
+    """Validate untrusted manifest entries. Returns (entries, invalid_count).
+    Entries need a non-empty string sid and a string (or missing) title;
+    wrong-typed optional fields are dropped (ints are accepted for asin/isbn)."""
+    clean, invalid = [], 0
+    for e in raw:
+        if not isinstance(e, dict):
+            invalid += 1
+            continue
+        sid, title = e.get("sid"), e.get("title")
+        if not isinstance(sid, str) or not sid.strip() or len(sid) > 512:
+            invalid += 1
+            continue
+        if title is not None and not isinstance(title, str):
+            invalid += 1
+            continue
+        out = {"sid": sid, "title": title or ""}
+        for k in ("author", "asin", "isbn", "hash"):
+            v = e.get(k)
+            if k in ("asin", "isbn") and isinstance(v, int) and not isinstance(v, bool):
+                v = str(v)
+            if isinstance(v, str):
+                out[k] = v
+        clean.append(out)
+    return clean, invalid
 
 
 def fetch_community_manifest(base_url, http_get=_http_get):
     """Return the v3 (curated-only) spine list, or None with a message if the
     server does not offer v3. v2 is deliberately NOT used: it includes
-    community uploads that have no licence terms."""
+    community uploads that have no licence terms. The manifest is untrusted:
+    its shape is checked here, its entries by sanitize_manifest()."""
     base = base_url.rstrip("/")
     try:
-        body, _ = http_get(f"{base}/api/spines/manifest/v3")
+        body, _ = http_get(f"{base}/api/spines/manifest/v3", max_bytes=MAX_MANIFEST_BYTES)
         data = json.loads(body.decode("utf-8"))
-        return data.get("spines", []), None
+        if not isinstance(data, dict) or not isinstance(data.get("spines"), list):
+            return None, f"Malformed manifest v3 from {base} (expected an object with a 'spines' list) — nothing imported."
+        return data["spines"], None
     except urllib.error.HTTPError as e:
         if e.code != 404:
             return None, f"Manifest v3 request failed: HTTP {e.code}"
@@ -617,7 +673,7 @@ def fetch_community_manifest(base_url, http_get=_http_get):
         return None, f"Could not fetch manifest v3 from {base}: {e}"
     # v3 missing — check whether this is an older server with only v2.
     try:
-        http_get(f"{base}/api/spines/manifest/v2")
+        http_get(f"{base}/api/spines/manifest/v2", max_bytes=MAX_MANIFEST_BYTES)
         return None, (f"{base} only offers manifest v2, which mixes in community "
                       "uploads without licence terms. Bulk import needs the "
                       "curated-only manifest v3 — skipping, nothing imported.")
@@ -635,7 +691,7 @@ def import_community_spines(community_url=DEFAULT_COMMUNITY_URL, dry_run=False,
     global _title_index, _books_by_id, _collisions
     summary = {"ok": False, "manifest": 0, "matched": 0, "downloaded": 0,
                "would_download": 0, "skipped_existing": 0, "failed": 0,
-               "unmatched": 0, "by_type": {}, "message": ""}
+               "unmatched": 0, "invalid": 0, "by_type": {}, "message": ""}
 
     if books is None:
         books = get_all_books()
@@ -649,6 +705,7 @@ def import_community_spines(community_url=DEFAULT_COMMUNITY_URL, dry_run=False,
         summary["message"] = err
         log(err)
         return summary
+    entries, summary["invalid"] = sanitize_manifest(entries)
     summary["manifest"] = len(entries)
 
     # Index ABS books so the existing scanner can tell which books already
@@ -684,14 +741,17 @@ def import_community_spines(community_url=DEFAULT_COMMUNITY_URL, dry_run=False,
             log(f"  [dry-run] {book.get('title', bid)} <- {entry.get('title')} ({mtype})")
             continue
         try:
-            data, ctype = http_get(f"{base}/api/spine/{urllib.parse.quote(str(entry['sid']), safe='')}")
+            data, _ctype = http_get(f"{base}/api/spine/{urllib.parse.quote(entry['sid'], safe='')}",
+                                    max_bytes=MAX_IMAGE_BYTES)
         except Exception as e:
             summary["failed"] += 1
             log(f"  FAILED {book.get('title', bid)}: {e}")
             continue
-        ext = mimetypes.guess_extension((ctype or "").split(";")[0].strip()) or ".webp"
-        if ext not in IMAGE_EXTS:
-            ext = ".webp"
+        ext = sniff_image_ext(data)  # trust the bytes, not the Content-Type
+        if ext is None:
+            summary["failed"] += 1
+            log(f"  FAILED {book.get('title', bid)}: not a PNG/JPEG/WebP image")
+            continue
         dest = safe_dest_path(community_dir, bid, ext)
         if dest is None:
             summary["failed"] += 1
@@ -716,7 +776,9 @@ def import_community_spines(community_url=DEFAULT_COMMUNITY_URL, dry_run=False,
         f"Matched {summary['matched']} of your books ({bt or 'none'}); "
         f"{action}, skipped {summary['skipped_existing']} that already have a spine, "
         f"{summary['unmatched']} community spines not in your library"
-        + (f", {summary['failed']} failed" if summary["failed"] else "") + ".")
+        + (f", {summary['failed']} failed" if summary["failed"] else "")
+        + (f", {summary['invalid']} malformed manifest entries skipped"
+           if summary["invalid"] else "") + ".")
     log(summary["message"])
     return summary
 
