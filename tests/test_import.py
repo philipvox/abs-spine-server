@@ -47,16 +47,23 @@ MANIFEST = [
 class FakeHTTP:
     def __init__(self, manifest=MANIFEST, v3=True):
         self.manifest, self.v3, self.calls = manifest, v3, []
+        self.images = {}
 
-    def __call__(self, url, timeout=30):
+    def __call__(self, url, timeout=30, max_bytes=None):
         self.calls.append(url)
         if url == BASE + "/api/spines/manifest/v3":
             if not self.v3:
                 raise urllib.error.HTTPError(url, 404, "Not Found", {}, io.BytesIO())
+            if isinstance(self.manifest, bytes):
+                return self.manifest, "application/json"
+            if not isinstance(self.manifest, list):
+                return json.dumps(self.manifest).encode(), "application/json"
             return json.dumps({"version": 3, "spines": self.manifest}).encode(), "application/json"
         if url == BASE + "/api/spines/manifest/v2":
             return b'{"version": 2, "books": []}', "application/json"
         if url.startswith(BASE + "/api/spine/"):
+            if url in self.images:
+                return self.images[url]
             return b"RIFFxxxxWEBP" + url.rsplit("/", 1)[1].encode(), "image/webp"
         raise urllib.error.HTTPError(url, 404, "Not Found", {}, io.BytesIO())
 
@@ -272,6 +279,128 @@ class UntrustedManifestPathTests(unittest.TestCase):
         ss.import_community_spines(BASE, books=books, http_get=http, log=lambda *_: None)
         spine_calls = [u for u in http.calls if "/api/spine/" in u]
         self.assertEqual(spine_calls, [BASE + "/api/spine/..%2F..%2Fadmin%3Fx%3D1"])
+
+
+PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+DUNE = [{"id": "uuid-dune", "title": "Dune", "author": "Frank Herbert", "asin": "BDUNE", "isbn": ""}]
+
+
+class MalformedManifestTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.spines = os.path.join(self.tmp, "spines")
+        os.makedirs(self.spines)
+        ss._config = {"spines_dir": self.spines, "linked_folders": []}
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp)
+
+    def run_import(self, http, books=DUNE):
+        return ss.import_community_spines(BASE, books=books, http_get=http, log=lambda *_: None)
+
+    def test_bad_top_level_shapes(self):
+        for manifest in ([{"sid": "x"}], {"spines": "nope"}, {"spines": {"a": 1}},
+                         {"nothing": 1}, b"not json", b"[1, 2]", b"null"):
+            http = FakeHTTP()
+            http.manifest = manifest  # bypass the list wrapping in FakeHTTP
+            if isinstance(manifest, list):
+                http.manifest = json.dumps(manifest).encode()
+            with self.subTest(manifest=manifest):
+                r = self.run_import(http)
+                self.assertFalse(r["ok"])
+                self.assertTrue(r["message"])
+
+    def test_bad_entries_skipped_and_counted(self):
+        manifest = [
+            "a string", 42, None, ["list"],
+            {"title": "no sid"},
+            {"sid": 7, "title": "int sid"},
+            {"sid": "s-dict-title", "title": {"x": 1}},
+            # wrong-typed optional fields are ignored, the entry is kept:
+            {"sid": "s-dune", "title": "Dune", "author": "Frank Herbert",
+             "asin": 12345, "isbn": ["x"], "hash": ["not", "a", "string"]},
+        ]
+        r = self.run_import(FakeHTTP(manifest=manifest))
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["invalid"], 7)
+        self.assertIn("7", r["message"])
+        self.assertEqual(r["manifest"], 1)
+        self.assertEqual(r["downloaded"], 1)   # matched by title + author
+
+    def test_int_asin_matches_string_asin(self):
+        books = [dict(DUNE[0], asin="12345")]
+        manifest = [{"sid": "s1", "title": "zzz", "author": "zzz", "asin": 12345}]
+        matches, _ = ss.match_community_spines(ss.sanitize_manifest(manifest)[0], books)
+        self.assertIn("uuid-dune", matches)
+
+    def test_non_image_download_rejected(self):
+        manifest = [{"sid": "s1", "title": "Dune", "author": "Frank Herbert", "asin": "BDUNE"}]
+        http = FakeHTTP(manifest=manifest)
+        http.images[BASE + "/api/spine/s1"] = (b"<html>oops</html>", "image/webp")
+        r = self.run_import(http)
+        self.assertEqual(r["downloaded"], 0)
+        self.assertEqual(r["failed"], 1)
+        self.assertFalse(os.listdir(os.path.join(self.spines, "community")))
+
+    def test_extension_from_magic_bytes(self):
+        manifest = [{"sid": "s1", "title": "Dune", "author": "Frank Herbert", "asin": "BDUNE"}]
+        http = FakeHTTP(manifest=manifest)
+        http.images[BASE + "/api/spine/s1"] = (PNG, "image/webp")
+        r = self.run_import(http)
+        self.assertEqual(r["downloaded"], 1)
+        self.assertEqual(os.listdir(os.path.join(self.spines, "community")), ["uuid-dune.png"])
+
+
+class FakeResp:
+    def __init__(self, body, length=None):
+        self.body, self.pos = body, 0
+        self.headers = {"Content-Type": "image/png"}
+        if length is not None:
+            self.headers["Content-Length"] = str(length)
+
+    def read(self, n=-1):
+        chunk = self.body[self.pos:] if n < 0 else self.body[self.pos:self.pos + n]
+        self.pos += len(chunk)
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class HttpGetCapTests(unittest.TestCase):
+    def setUp(self):
+        self._orig = ss.urllib.request.urlopen
+
+    def tearDown(self):
+        ss.urllib.request.urlopen = self._orig
+
+    def test_body_over_cap_rejected(self):
+        ss.urllib.request.urlopen = lambda req, timeout=None: FakeResp(b"x" * 101)
+        with self.assertRaises(ValueError):
+            ss._http_get("https://x.test/a", max_bytes=100)
+
+    def test_content_length_over_cap_rejected_early(self):
+        resp = FakeResp(b"x" * 10, length=10 ** 9)
+        ss.urllib.request.urlopen = lambda req, timeout=None: resp
+        with self.assertRaises(ValueError):
+            ss._http_get("https://x.test/a", max_bytes=100)
+        self.assertEqual(resp.pos, 0)
+
+    def test_under_cap_ok(self):
+        ss.urllib.request.urlopen = lambda req, timeout=None: FakeResp(b"x" * 100)
+        body, ctype = ss._http_get("https://x.test/a", max_bytes=100)
+        self.assertEqual(len(body), 100)
+        self.assertEqual(ss.MAX_IMAGE_BYTES, 10 * 1024 * 1024)
+
+    def test_image_sniffing(self):
+        self.assertEqual(ss.sniff_image_ext(PNG), ".png")
+        self.assertEqual(ss.sniff_image_ext(b"\xff\xd8\xff\xe0" + b"\0" * 8), ".jpg")
+        self.assertEqual(ss.sniff_image_ext(b"RIFF\0\0\0\0WEBPVP8 "), ".webp")
+        self.assertIsNone(ss.sniff_image_ext(b"<html>"))
+        self.assertIsNone(ss.sniff_image_ext(b""))
 
 
 if __name__ == "__main__":
