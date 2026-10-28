@@ -512,14 +512,28 @@ def _norm_isbn(v):
     return re.sub(r"[^0-9X]", "", (v or "").strip().upper())
 
 
+def author_last_names(author):
+    """Normalized last names for an author string ("A Smith, B. Jones & C Lee")."""
+    names = set()
+    for part in re.split(r",|;|&|\band\b", author or "", flags=re.IGNORECASE):
+        tokens = normalize(part).split()
+        if tokens:
+            names.add(tokens[-1])
+    names.discard("unknown")
+    return names
+
+
 def match_community_spines(entries, books):
     """
     Match community manifest entries to ABS books.
-    Order: ASIN, then ISBN, then title|author hash, then the local fuzzy
-    title matcher. Returns ({book_id: (entry, match_type)}, unmatched_entries).
+    Order: ASIN, then ISBN, then title|author hash, then a strict title
+    fallback (exact normalized title AND a matching author last name — no
+    containment, never an id taken from manifest text).
+    Returns ({book_id: (entry, match_type)}, unmatched_entries).
     When several entries hit one book the strongest match wins.
     """
     by_asin, by_isbn, by_hash = {}, {}, {}
+    by_title = {}  # normalized title -> [(book_id, last_names)]
     for b in books:
         a = _norm_asin(b.get("asin"))
         if a:
@@ -528,9 +542,17 @@ def match_community_spines(entries, books):
         if i:
             by_isbn.setdefault(i, b["id"])
         by_hash.setdefault(community_hash(b.get("title", ""), b.get("author", "")), b["id"])
+        nt = normalize(b.get("title"))
+        if nt:
+            by_title.setdefault(nt, []).append((b["id"], author_last_names(b.get("author"))))
 
-    title_index, _ = build_title_index(books)
-    no_ids = {}  # never let a community title masquerade as an item id
+    def title_match(e):
+        nt = normalize(e.get("title"))
+        last = author_last_names(e.get("author"))
+        if not nt or not last:
+            return None
+        hits = {bid for bid, names in by_title.get(nt, []) if names & last}
+        return hits.pop() if len(hits) == 1 else None  # ambiguous -> skip
 
     matches = {}
     unmatched = []
@@ -545,10 +567,7 @@ def match_community_spines(entries, books):
         elif e.get("hash") and e["hash"] in by_hash:
             hit = (by_hash[e["hash"]], "hash")
         else:
-            name = e.get("title", "")
-            if e.get("author"):
-                name = f"{e['author']} - {name}"
-            bid, _mt = match_filename_to_book(name, title_index, no_ids)
+            bid = title_match(e)
             if bid:
                 hit = (bid, "title")
         if not hit:

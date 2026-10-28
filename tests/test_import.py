@@ -153,5 +153,69 @@ class ImportTests(unittest.TestCase):
         self.assertEqual(unmatched, [])
 
 
+def _entry(sid, title, author):
+    # No asin/isbn and a hash that never matches, so only the title fallback applies.
+    return {"sid": sid, "title": title, "author": author, "hash": "f" * 16}
+
+
+class CommunityTitleFallbackTests(unittest.TestCase):
+    """The title fallback must require the author too, and an exact title."""
+
+    def match(self, book, entry):
+        books = [dict(book, asin="", isbn="")]
+        matches, _ = ss.match_community_spines([entry], books)
+        return book["id"] in matches
+
+    def test_wrong_matches_rejected(self):
+        bad = [
+            # same title, different author
+            ({"id": "b1", "title": "Chosen", "author": "Ted Dekker"},
+             _entry("e1", "Chosen", "Benedict Jacka")),
+            ({"id": "b2", "title": "Fables", "author": "Aesop"},
+             _entry("e2", "Fables", "Bill Willingham")),
+            # containment, different author
+            ({"id": "b3", "title": "Hidden", "author": "P. C. Cast"},
+             _entry("e3", "Hidden River", "Adrian McKinty")),
+            ({"id": "b4", "title": "The Window", "author": "Amelia Glaser"},
+             _entry("e4", "The Woman in the Window", "A. J. Finn")),
+            ({"id": "b5", "title": "Silence", "author": "Shusaku Endo"},
+             _entry("e5", "Silence in Hanover Close", "Anne Perry")),
+            # containment even with the same author is not a match
+            ({"id": "b6", "title": "Silence", "author": "Anne Perry"},
+             _entry("e6", "Silence in Hanover Close", "Anne Perry")),
+            ({"id": "b7", "title": "Hidden", "author": "Adrian McKinty"},
+             _entry("e7", "Hidden River", "Adrian McKinty")),
+            # entry with no author never title-matches
+            ({"id": "b8", "title": "Chosen", "author": "Ted Dekker"},
+             _entry("e8", "Chosen", "")),
+        ]
+        for book, entry in bad:
+            with self.subTest(book=book["title"], entry=entry["title"]):
+                self.assertFalse(self.match(book, entry))
+
+    def test_true_positives(self):
+        good = [
+            ({"id": "g1", "title": "Chosen", "author": "Ted Dekker"},
+             _entry("e1", "Chosen", "Ted Dekker")),
+            ({"id": "g2", "title": "Dune", "author": "Frank Herbert"},
+             _entry("e2", "Dune", "F. Herbert")),
+            ({"id": "g3", "title": "Ender's Game", "author": "Orson Scott Card"},
+             _entry("e3", "Enders Game", "Orson Scott Card")),
+            ({"id": "g4", "title": "Fables", "author": "Bill Willingham"},
+             _entry("e4", "FABLES", "Bill Willingham")),
+            ({"id": "g5", "title": "Good Omens", "author": "Terry Pratchett, Neil Gaiman"},
+             _entry("e5", "Good Omens", "Neil Gaiman")),
+        ]
+        for book, entry in good:
+            with self.subTest(book=book["title"]):
+                self.assertTrue(self.match(book, entry))
+
+    def test_ambiguous_title_author_skipped(self):
+        books = [{"id": "x1", "title": "Chosen", "author": "Ted Dekker", "asin": "", "isbn": ""},
+                 {"id": "x2", "title": "Chosen", "author": "Ted Dekker", "asin": "", "isbn": ""}]
+        matches, _ = ss.match_community_spines([_entry("e", "Chosen", "Ted Dekker")], books)
+        self.assertEqual(matches, {})
+
+
 if __name__ == "__main__":
     unittest.main()
